@@ -130,7 +130,7 @@ jobs:
             or commit message.
 
           claude_args: |
-            --model claude-sonnet-4-5-20250929
+            --model claude-sonnet-5
             --max-turns 35
             --allowedTools "Read,Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr merge:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh label create:*),mcp__github_inline_comment__create_inline_comment"
 
