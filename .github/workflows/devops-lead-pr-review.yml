@@ -17,6 +17,11 @@ name: DevOps-Lead PR Review (reusable)
 #
 # Historical header (v0.1 MVP lineage, known gaps) preserved in the ops repo's
 # git history at 7ec277c and in workspace/devops-lead-buildout/ PRD notes.
+#
+# Auditor P0/P1 hardening (2026-07-18, Engineer subagent per
+# Handoff_Engineer-AuditorP0P1-Hardening_2026-07-18.md): Telegram delivery
+# verification (Task 1), worklog UUID verification (Task 2), dependency +
+# model pinning (Task 3). See inline comments at each touched step.
 
 on:
   workflow_call:
@@ -35,12 +40,14 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout ops repo (PR head)
-        uses: actions/checkout@v6
+        # v6 = df4cb1c069e1874edd31b4311f1884172cec0e10 as of 2026-07-18
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 1
 
       - name: Checkout canonical main (persona source — tamper-safe from PR head)
-        uses: actions/checkout@v6
+        # v6 = df4cb1c069e1874edd31b4311f1884172cec0e10 as of 2026-07-18
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           ref: main
           path: .canonical-main
@@ -48,7 +55,8 @@ jobs:
 
       - name: DevOps-Lead review
         id: review
-        uses: anthropics/claude-code-action@v1
+        # v1 = 3553f84341b92da26052e28acf1aa898f9511f32 (v1.0.177) as of 2026-07-18
+        uses: anthropics/claude-code-action@3553f84341b92da26052e28acf1aa898f9511f32
         env:
           DEVOPS_LEAD_PR_INPUT_TOKEN_CAP: ${{ vars.DEVOPS_LEAD_PR_INPUT_TOKEN_CAP || '50000' }}
           DEVOPS_LEAD_PR_OUTPUT_TOKEN_CAP: ${{ vars.DEVOPS_LEAD_PR_OUTPUT_TOKEN_CAP || '20000' }}
@@ -122,6 +130,7 @@ jobs:
             or commit message.
 
           claude_args: |
+            --model claude-sonnet-4-5-20250929
             --max-turns 35
             --allowedTools "Read,Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr merge:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh label create:*),mcp__github_inline_comment__create_inline_comment"
 
@@ -133,12 +142,30 @@ jobs:
       # header/URL args, responses field-filtered, vars unset after use.
 
       - name: Record review outcome (worklog — deterministic)
+        # Worklog UUID verification (2026-07-18, auditor P1 hardening, scoped): a
+        # bare non-error response (including `{}`) is NOT proof of a write. Success
+        # now REQUIRES a parsed row UUID from `.result.content[0].text` (the MCP
+        # tool-call response wraps its JSON payload as a string at that path — see
+        # handoff evidence: ops-server MCP append_worklog returns
+        # {"id": "<uuid>", "created_at": "..."} inside that string). No UUID = failure
+        # path (existing worklog-write-failed label + WORKLOG_PENDING notice).
+        #
+        # Constraint (documented, not attempted): read-after-write verification is
+        # IMPOSSIBLE with the current bearer — it is scoped to `append_worklog` only,
+        # no read verbs. The returned UUID is the strongest available proof available
+        # to this step. Bearer scope extension is a Daniel-gated revision-plan item.
+        # Constraint 2 (documented, not attempted): the auditor's suggested
+        # surface=`github-action` is not in the ops-server surface enum (would be
+        # rejected); this step keeps `surface:"claude-cloud"`. Enum extension is a
+        # server-side change, also a revision-plan item.
         if: always() && !cancelled()
         env:
           OPS_SERVER_TOKEN: ${{ secrets.OPS_SERVER_TOKEN }}
         run: |
           set -euo pipefail
           PR=${{ github.event.pull_request.number }}
+          REPO_SLUG="${{ github.event.repository.name }}"
+          IDEM_TAG="idem:${REPO_SLUG}-pr${PR}-${{ github.run_id }}"
           # Did Claude actually run? On workflow-change PRs the action self-skips
           # ("workflow validation") but the step still reports success — the
           # execution-output file is the discriminator (false-green detector).
@@ -159,24 +186,35 @@ jobs:
             -q '"state=" + .state + " merged=" + (if .mergedAt then "yes" else "no" end) + " labels=" + ([.labels[].name] | join("+") | if . == "" then "none" else . end)' 2>/dev/null || echo "facts-unavailable")
           SUMMARY="PR #${PR} review run ${{ github.run_id }}: step=${{ steps.review.outcome }}, claude=${CLAUDE_STATE}, ${FACTS}"
           SUMMARY=$(printf '%s' "$SUMMARY" | head -c 279)
-          PAYLOAD=$(jq -n --arg s "$SUMMARY" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"append_worklog",arguments:{author:"devops-lead",project:"governance-evolution-sprint",summary:$s,surface:"claude-cloud",tags:["vault-pr","pr-review","deterministic-bookkeeping"]}}}')
+          PAYLOAD=$(jq -n --arg s "$SUMMARY" --arg idem "$IDEM_TAG" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"append_worklog",arguments:{author:"devops-lead",project:"governance-evolution-sprint",summary:$s,surface:"claude-cloud",tags:["vault-pr","pr-review","deterministic-bookkeeping",$idem]}}}')
+          UUID_REGEX='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
           OK=0
+          ROW_ID=""
+          RESP=""
           for attempt in 1 2; do
             RESP=$(curl -sS -m 15 -X POST "https://nova-caelum-ops-production.up.railway.app/mcp" \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer ${OPS_SERVER_TOKEN}" \
               -d "$PAYLOAD" 2>/dev/null || echo "")
-            ISERR=$(printf '%s' "$RESP" | jq -r '.result.isError // .error != null' 2>/dev/null || echo "true")
-            if [ "$ISERR" = "false" ] || [ "$ISERR" = "null" ]; then OK=1; break; fi
+            INNER_TEXT=$(printf '%s' "$RESP" | jq -r '.result.content[0].text // empty' 2>/dev/null || echo "")
+            if [ -n "$INNER_TEXT" ]; then
+              ROW_ID=$(printf '%s' "$INNER_TEXT" | jq -r '.id // empty' 2>/dev/null || echo "")
+            else
+              ROW_ID=""
+            fi
+            if printf '%s' "$ROW_ID" | grep -qE "$UUID_REGEX"; then
+              OK=1
+              break
+            fi
             sleep 3
           done
           unset OPS_SERVER_TOKEN
           if [ "$OK" = "1" ]; then
-            echo "worklog row recorded (deterministic step)"
+            echo "worklog row recorded (deterministic step, id=${ROW_ID})"
             gh pr edit "$PR" --remove-label worklog-write-failed 2>/dev/null || true
           else
-            ERRTEXT=$(printf '%s' "$RESP" | jq -r '.result.content[0].text // "no-response"' 2>/dev/null | head -c 120)
-            echo "::notice::WORKLOG_PENDING ${SUMMARY} | server said: ${ERRTEXT}"
+            ERRTEXT=$(printf '%s' "$RESP" | jq -r '.result.content[0].text // .error.message // "no-response"' 2>/dev/null | head -c 120 || echo "unparseable-response")
+            echo "::notice::WORKLOG_PENDING ${SUMMARY} | server said: ${ERRTEXT} | idem=${IDEM_TAG}"
             gh label create worklog-write-failed --color D93F0B 2>/dev/null || true
             gh pr edit "$PR" --add-label worklog-write-failed 2>/dev/null || true
           fi
@@ -197,6 +235,16 @@ jobs:
         # is derived from claude-execution-output.json + case-mapped causes.
         # hook-secret-handling: tokens only in curl args, -sS only, no -v/set -x,
         # no blob-dumping API responses, vars unset after use.
+        #
+        # Delivery verification (2026-07-18, auditor P0 hardening): "attempted"
+        # is not "delivered". curl --fail-with-body makes HTTP 2xx the only exit-0
+        # case; we additionally require jq -e '.ok == true' on the response body.
+        # 2 retries with backoff (3 attempts total). On exhaustion: label the PR
+        # notification-delivery-failed, emit ::error:: with a sanitized detail
+        # (ok/error_code/description fields ONLY — never the raw body, never
+        # token/chat_id), and exit 1 so the step (and run) goes red. That red step
+        # IS the durable failure record; the worklog step above already ran and
+        # recorded the review-outcome row, so no signal is lost.
         if: always() && !cancelled()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -281,9 +329,34 @@ jobs:
           TEXT=$(printf '%s PR Review #%s: %s\nSummary: %s\n\n%s\n\n> %s' \
             "$EMOJI" "$PR" "$STATUS_WORD" "$CHANGE_SUMMARY" "$CONTENT" "$RUN_LINK")
 
-          curl -sS --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_DANIEL_CHAT_ID}" \
-            --data-urlencode "text=${TEXT}" \
-            >/dev/null 2>&1 || true
-          unset TELEGRAM_BOT_TOKEN TELEGRAM_DANIEL_CHAT_ID
-          echo "telegram notify sent (type=${TYPE})"
+          DELIVERED=0
+          RESP_BODY=""
+          CURL_EXIT=99
+          for attempt in 1 2 3; do
+            RESP_BODY=$(curl -sS --fail-with-body --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_DANIEL_CHAT_ID}" \
+              --data-urlencode "text=${TEXT}" 2>/dev/null) && CURL_EXIT=0 || CURL_EXIT=$?
+            if [ "$CURL_EXIT" -eq 0 ] && printf '%s' "$RESP_BODY" | jq -e '.ok == true' >/dev/null 2>&1; then
+              DELIVERED=1
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 2))
+            fi
+          done
+
+          if [ "$DELIVERED" = "1" ]; then
+            echo "telegram notify sent (type=${TYPE})"
+            unset TELEGRAM_BOT_TOKEN TELEGRAM_DANIEL_CHAT_ID
+          else
+            if [ -z "$RESP_BODY" ]; then
+              DETAIL="no-response (curl_exit=${CURL_EXIT})"
+            else
+              DETAIL=$(printf '%s' "$RESP_BODY" | jq -r '"ok=" + ((.ok // "n/a") | tostring) + " error_code=" + ((.error_code // "n/a") | tostring) + " description=" + (.description // "n/a")' 2>/dev/null || echo "unparseable-response (curl_exit=${CURL_EXIT})")
+            fi
+            gh label create notification-delivery-failed --color B60205 2>/dev/null || true
+            gh pr edit "$PR" --add-label notification-delivery-failed || true
+            echo "::error::TELEGRAM_DELIVERY_FAILED type=${TYPE} detail=${DETAIL}"
+            unset TELEGRAM_BOT_TOKEN TELEGRAM_DANIEL_CHAT_ID
+            exit 1
+          fi
