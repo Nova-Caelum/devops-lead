@@ -1,0 +1,273 @@
+name: DevOps-Lead PR Review (reusable)
+
+# REUSABLE WORKFLOW — Option B source-of-truth/runtime split (2026-07-18).
+# This repo (Highproofhero/devops-lead) is the SOURCE OF TRUTH for DevOps-Lead's
+# PR-review logic. The ops repo (novacaelum-aaasops) carries only a thin stub
+# that calls this workflow; the stub's pin (@SHA after probe passes) is the
+# review gate for logic changes.
+#
+# Execution context: runs in the CALLER's context — github.* refs, secrets
+# (via `secrets: inherit`), vars, and GITHUB_TOKEN all resolve against the
+# calling repository (novacaelum-aaasops). Body below is byte-identical to
+# ops-repo commit 7ec277c (unified Telegram template) except this trigger block.
+#
+# Change ceremony: edit here -> PR/review in THIS repo -> bump the pin in the
+# ops-repo stub (one-line PR, human-reviewable in seconds; the deterministic
+# steps escalate it loudly since it touches .github/workflows/).
+#
+# Historical header (v0.1 MVP lineage, known gaps) preserved in the ops repo's
+# git history at 7ec277c and in workspace/devops-lead-buildout/ PRD notes.
+
+on:
+  workflow_call:
+
+jobs:
+  devops-lead-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout ops repo (PR head)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Checkout canonical main (persona source — tamper-safe from PR head)
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: .canonical-main
+          fetch-depth: 1
+
+      - name: DevOps-Lead review
+        id: review
+        uses: anthropics/claude-code-action@v1
+        env:
+          DEVOPS_LEAD_PR_INPUT_TOKEN_CAP: ${{ vars.DEVOPS_LEAD_PR_INPUT_TOKEN_CAP || '50000' }}
+          DEVOPS_LEAD_PR_OUTPUT_TOKEN_CAP: ${{ vars.DEVOPS_LEAD_PR_OUTPUT_TOKEN_CAP || '20000' }}
+          DEVOPS_LEAD_MONTHLY_BUDGET_USD: ${{ vars.DEVOPS_LEAD_MONTHLY_BUDGET_USD || '10' }}
+          OPS_SERVER_TOKEN: ${{ secrets.OPS_SERVER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_DANIEL_CHAT_ID: ${{ secrets.TELEGRAM_DANIEL_CHAT_ID }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR AUTHOR: ${{ github.event.pull_request.user.login }}
+
+            You are acting as DevOps-Lead (full persona instructions appended below via
+            --append-system-prompt) reviewing a pull request against `novacaelum-aaasops`
+            — the git-preservation mirror of the vault `_agentOS/` canonical layer
+            (governance-evolution-sprint, 2026-07-17). This is v0.1 MVP: review, classify,
+            comment, and merge-or-escalate. Tonight this workflow is being run as a live
+            production-cycle demo — Daniel is watching one full cycle end-to-end.
+
+            ## Task
+            0. FIRST: Read `.canonical-main/_agentOS/agent_profiles/devops-lead/devops-lead.md`.
+               That file IS your persona and operating instructions (DevOps-Lead). Adopt it
+               fully before proceeding — it defines your review discipline, caps, and tone.
+            1. Run `gh pr diff ${{ github.event.pull_request.number }}` to see the changed files.
+            2. Classify the diff against this allowlist (adapted from PRD AD-5 for the
+               ops-repo context, where the tracked content is `_agentOS/**` plus repo
+               scaffolding):
+               - AUTO-MERGE-SAFE: docs-only markdown, `README.md`, `.gitignore`,
+                 `outputs/**`, `platform/**` (legacy PromptOps scaffold, not live).
+               - ESCALATE (always, never auto-merge): `_agentOS/rules/**`,
+                 `_agentOS/system/**`, `_agentOS/skills/**`,
+                 `_agentOS/agent_profiles/**` (non-prose / frontmatter changes),
+                 `.github/workflows/**`, any diff containing credential-shaped strings,
+                 any diff you cannot confidently classify.
+            3. Self-PR safety (PRD AD-8 / Q4): if PR AUTHOR looks like an automation/bot
+               identity rather than a human GitHub user, do NOT auto-merge regardless of
+               tier unless the PR carries a `human-approved` label. State this explicitly
+               in your comment if it applies.
+            4. Cost/safety caps: read `DEVOPS_LEAD_PR_INPUT_TOKEN_CAP` /
+               `_OUTPUT_TOKEN_CAP` / `_MONTHLY_BUDGET_USD` from env and reason about them —
+               these are NOT hard-metered by the job (see workflow file header comment);
+               keep your own review proportionate to a small-diff maintenance PR.
+            5. Post your verdict as a PR comment via `gh pr comment` — state the tier,
+               your rationale, and whether you attempted a merge. Your comment MUST
+               include, on its own line, `CHANGE-SUMMARY: <one sentence describing what
+               this PR changes>`. If (and only if) this PR is ESCALATE tier, also include
+               a line `ESCALATION-REASON: <one sentence on what Daniel needs to review and
+               why it matters>`. A later deterministic workflow step parses these exact
+               marker lines to build Daniel's Telegram notification — use the literal
+               marker text verbatim, one sentence each, no markdown around the marker.
+            6. If AUTO-MERGE-SAFE and not self-PR-blocked: run
+               `gh pr merge ${{ github.event.pull_request.number }} --auto --squash`.
+            7. If ESCALATE: apply the escalation label via
+               `gh pr edit ${{ github.event.pull_request.number }} --add-label escalate-daniel`
+               (create the label first with `gh label create` if it doesn't exist yet,
+               ignore the error if it already does). Do NOT attempt any Telegram call or
+               any other curl — a later workflow step sends the escalation notice
+               automatically when it sees the `escalate-daniel` label. (2026-07-18: in-model
+               secret-bearing curl is structurally impossible here — the Bash permission
+               evaluator denies any command containing env-var expansion, "Contains
+               simple_expansion". Stress-test evidence: PR #3, PR #4.)
+            8. Worklog bookkeeping is AUTOMATED by a later workflow step — do not attempt
+               to write the worklog yourself. Your job ends at: comment posted +
+               merge-or-label executed.
+
+            Never claim you merged a PR you did not actually run `gh pr merge` on. Never
+            print secret values (or anything derived from them) to any comment, log line,
+            or commit message.
+
+          claude_args: |
+            --max-turns 35
+            --allowedTools "Read,Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr merge:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh label create:*),mcp__github_inline_comment__create_inline_comment"
+
+      # Deterministic bookkeeping (2026-07-18): the model CANNOT do secret-bearing curl
+      # (permission evaluator denies env-var expansion — "Contains simple_expansion";
+      # stress-test evidence PR #3/#4). Worklog + escalation-Telegram therefore live in
+      # workflow steps, where secrets work natively (same pattern as the failure-alert
+      # step below). hook-secret-handling: -sS only, no -v, no set -x, tokens only in
+      # header/URL args, responses field-filtered, vars unset after use.
+
+      - name: Record review outcome (worklog — deterministic)
+        if: always() && !cancelled()
+        env:
+          OPS_SERVER_TOKEN: ${{ secrets.OPS_SERVER_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR=${{ github.event.pull_request.number }}
+          # Did Claude actually run? On workflow-change PRs the action self-skips
+          # ("workflow validation") but the step still reports success — the
+          # execution-output file is the discriminator (false-green detector).
+          if [ -f /home/runner/work/_temp/claude-execution-output.json ]; then
+            CLAUDE_STATE="ran"
+          else
+            CLAUDE_STATE="validation-skip (action never launched Claude — likely workflow-change PR)"
+          fi
+          FACTS=$(gh pr view "$PR" --json state,mergedAt,labels \
+            -q '"state=" + .state + " merged=" + (if .mergedAt then "yes" else "no" end) + " labels=" + ([.labels[].name] | join("+") | if . == "" then "none" else . end)' 2>/dev/null || echo "facts-unavailable")
+          SUMMARY="PR #${PR} review run ${{ github.run_id }}: step=${{ steps.review.outcome }}, claude=${CLAUDE_STATE}, ${FACTS}"
+          SUMMARY=$(printf '%s' "$SUMMARY" | head -c 279)
+          PAYLOAD=$(jq -n --arg s "$SUMMARY" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"append_worklog",arguments:{author:"devops-lead",project:"governance-evolution-sprint",summary:$s,surface:"claude-cloud",tags:["vault-pr","pr-review","deterministic-bookkeeping"]}}}')
+          OK=0
+          for attempt in 1 2; do
+            RESP=$(curl -sS -m 15 -X POST "https://nova-caelum-ops-production.up.railway.app/mcp" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${OPS_SERVER_TOKEN}" \
+              -d "$PAYLOAD" 2>/dev/null || echo "")
+            ISERR=$(printf '%s' "$RESP" | jq -r '.result.isError // .error != null' 2>/dev/null || echo "true")
+            if [ "$ISERR" = "false" ] || [ "$ISERR" = "null" ]; then OK=1; break; fi
+            sleep 3
+          done
+          unset OPS_SERVER_TOKEN
+          if [ "$OK" = "1" ]; then
+            echo "worklog row recorded (deterministic step)"
+            gh pr edit "$PR" --remove-label worklog-write-failed 2>/dev/null || true
+          else
+            ERRTEXT=$(printf '%s' "$RESP" | jq -r '.result.content[0].text // "no-response"' 2>/dev/null | head -c 120)
+            echo "::notice::WORKLOG_PENDING ${SUMMARY} | server said: ${ERRTEXT}"
+            gh label create worklog-write-failed --color D93F0B 2>/dev/null || true
+            gh pr edit "$PR" --add-label worklog-write-failed 2>/dev/null || true
+          fi
+
+      - name: Telegram notify (review outcome)
+        # Single deterministic notify step (2026-07-18, replaces the former
+        # "Escalation notice" + "Notify Daniel on failure" pair). Every PR
+        # review pings once, in Daniel's template:
+        #   [emoji] PR Review #[X]: [Pass/Fail/Escalation]
+        #   Summary: [one sentence]
+        #
+        #   (type-specific content)
+        #
+        #   > [run link]
+        # Content is sourced, never invented: Summary/Escalation-reason come
+        # from CHANGE-SUMMARY:/ESCALATION-REASON: markers the model is
+        # instructed to emit in its PR comment (step 5 above); Fail content
+        # is derived from claude-execution-output.json + case-mapped causes.
+        # hook-secret-handling: tokens only in curl args, -sS only, no -v/set -x,
+        # no blob-dumping API responses, vars unset after use.
+        if: always() && !cancelled()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_DANIEL_CHAT_ID: ${{ secrets.TELEGRAM_DANIEL_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          PR=${{ github.event.pull_request.number }}
+          RUN_LINK="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # --- classify: fail (review step didn't succeed) / escalation (label) / pass ---
+          if [ "${{ steps.review.outcome }}" != "success" ]; then
+            TYPE="fail"
+          else
+            HAS_ESC=$(gh pr view "$PR" --json labels -q '[.labels[].name] | contains(["escalate-daniel"])' 2>/dev/null || echo "false")
+            if [ "$HAS_ESC" = "true" ]; then TYPE="escalation"; else TYPE="pass"; fi
+          fi
+
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_DANIEL_CHAT_ID:-}" ]; then
+            echo "::notice::TELEGRAM_NOTIFY_SKIPPED telegram secrets unset — PR comment/worklog is the audit trail (type=${TYPE})"
+            exit 0
+          fi
+
+          # --- Summary line (all types), sourced from the model's CHANGE-SUMMARY marker ---
+          COMMENTS=$(gh pr view "$PR" --json comments -q '[.comments[].body] | join("\n---\n")' 2>/dev/null || echo "")
+          CHANGE_SUMMARY=$(printf '%s\n' "$COMMENTS" | grep -m1 '^CHANGE-SUMMARY:' | sed 's/^CHANGE-SUMMARY:[[:space:]]*//' || true)
+          if [ -z "$CHANGE_SUMMARY" ]; then
+            CHANGE_SUMMARY=$(gh pr view "$PR" --json title -q '.title' 2>/dev/null || echo "PR #${PR}")
+          fi
+
+          case "$TYPE" in
+            pass)
+              EMOJI="🟢"; STATUS_WORD="Pass"
+              CONTENT="Successful - no issue"
+              ;;
+            escalation)
+              EMOJI="🟡"; STATUS_WORD="Escalation"
+              ESCALATION_REASON=$(printf '%s\n' "$COMMENTS" | grep -m1 '^ESCALATION-REASON:' | sed 's/^ESCALATION-REASON:[[:space:]]*//' || true)
+              if [ -z "$ESCALATION_REASON" ]; then
+                ESCALATION_REASON="Touches a protected path — see the review comment on the PR."
+              fi
+              CONTENT="$ESCALATION_REASON"
+              ;;
+            fail)
+              EMOJI="🔴"; STATUS_WORD="Fail"
+              OUT="/home/runner/work/_temp/claude-execution-output.json"
+              if [ ! -f "$OUT" ]; then
+                CAUSE="The action never launched Claude (likely a workflow-file change or validation skip)."
+                NEXT="Claude to review the workflow file on this pull request."
+                RETRY="N"
+              else
+                ERRTEXT=$(jq -r 'if type=="array" then (.[-1].result // .[-1].error // empty) else (.result // .error // empty) end' "$OUT" 2>/dev/null | head -c 500 || true)
+                if printf '%s' "$ERRTEXT" | grep -qi 'error_max_turns'; then
+                  CAUSE="Claude hit its turn limit before finishing."
+                  NEXT="Claude to raise the turn limit or slim the review task."
+                  RETRY="Y"
+                elif printf '%s' "$ERRTEXT" | grep -qiE 'credit|billing|401|403|oauth'; then
+                  CAUSE="The Anthropic authentication or account balance rejected the run."
+                  NEXT="Daniel to check the Claude account/token."
+                  RETRY="Y"
+                elif [ -n "$ERRTEXT" ]; then
+                  CAUSE=$(printf '%s' "$ERRTEXT" | head -c 120)
+                  NEXT="Daniel to open the run log."
+                  RETRY="N"
+                else
+                  CAUSE="unknown — no error surfaced"
+                  NEXT="Daniel to open the run log."
+                  RETRY="N"
+                fi
+              fi
+              CONTENT=$(printf 'Failure Cause: %s\nNext Step: %s\nRetry: %s' "$CAUSE" "$NEXT" "$RETRY")
+              ;;
+          esac
+
+          TEXT=$(printf '%s PR Review #%s: %s\nSummary: %s\n\n%s\n\n> %s' \
+            "$EMOJI" "$PR" "$STATUS_WORD" "$CHANGE_SUMMARY" "$CONTENT" "$RUN_LINK")
+
+          curl -sS --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_DANIEL_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            >/dev/null 2>&1 || true
+          unset TELEGRAM_BOT_TOKEN TELEGRAM_DANIEL_CHAT_ID
+          echo "telegram notify sent (type=${TYPE})"
