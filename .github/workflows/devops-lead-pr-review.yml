@@ -146,6 +146,14 @@ jobs:
             CLAUDE_STATE="ran"
           else
             CLAUDE_STATE="validation-skip (action never launched Claude — likely workflow-change PR)"
+            # LAYER ONE (2026-07-18, Daniel-approved): the reviewer cannot review
+            # changes to its own definition — the action skips the model on
+            # workflow-change PRs, which previously looked like silent success.
+            # Convert the silent skip into a loud escalation: label here; the
+            # Telegram step below sends the escalation notice. The PR stays open
+            # awaiting human review. No branches/PRs are ever auto-created.
+            gh label create escalate-daniel --color FBCA04 2>/dev/null || true
+            gh pr edit "$PR" --add-label escalate-daniel 2>/dev/null || true
           fi
           FACTS=$(gh pr view "$PR" --json state,mergedAt,labels \
             -q '"state=" + .state + " merged=" + (if .mergedAt then "yes" else "no" end) + " labels=" + ([.labels[].name] | join("+") | if . == "" then "none" else . end)' 2>/dev/null || echo "facts-unavailable")
@@ -199,6 +207,10 @@ jobs:
           RUN_LINK="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # --- classify: fail (review step didn't succeed) / escalation (label) / pass ---
+          # Layer one: validation-skip (workflow-change PR, model never ran) is
+          # escalation-with-specific-reason; the worklog step already labeled it.
+          VALIDATION_SKIP=0
+          [ -f /home/runner/work/_temp/claude-execution-output.json ] || VALIDATION_SKIP=1
           if [ "${{ steps.review.outcome }}" != "success" ]; then
             TYPE="fail"
           else
@@ -225,9 +237,13 @@ jobs:
               ;;
             escalation)
               EMOJI="🟡"; STATUS_WORD="Escalation"
-              ESCALATION_REASON=$(printf '%s\n' "$COMMENTS" | grep -m1 '^ESCALATION-REASON:' | sed 's/^ESCALATION-REASON:[[:space:]]*//' || true)
-              if [ -z "$ESCALATION_REASON" ]; then
-                ESCALATION_REASON="Touches a protected path — see the review comment on the PR."
+              if [ "$VALIDATION_SKIP" = "1" ]; then
+                ESCALATION_REASON="This PR changes the reviewer's own workflow definition, so the automated review was skipped entirely — it needs your direct review before merge."
+              else
+                ESCALATION_REASON=$(printf '%s\n' "$COMMENTS" | grep -m1 '^ESCALATION-REASON:' | sed 's/^ESCALATION-REASON:[[:space:]]*//' || true)
+                if [ -z "$ESCALATION_REASON" ]; then
+                  ESCALATION_REASON="Touches a protected path — see the review comment on the PR."
+                fi
               fi
               CONTENT="$ESCALATION_REASON"
               ;;
