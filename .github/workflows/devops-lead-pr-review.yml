@@ -1,10 +1,16 @@
 name: DevOps-Lead PR Review (reusable)
 
-# REUSABLE WORKFLOW — Option B source-of-truth/runtime split (2026-07-18).
-# This repo (Highproofhero/devops-lead) is the SOURCE OF TRUTH for DevOps-Lead's
-# PR-review logic. The ops repo (novacaelum-aaasops) carries only a thin stub
+# REUSABLE WORKFLOW — Option B source-of-truth/runtime split (2026-07-18;
+# multi-tenant parameterization 2026-07-31).
+# This repo (Nova-Caelum/devops-lead — public since 2026-07-30) is the SOURCE OF
+# TRUTH for DevOps-Lead's PR-review logic. Caller repos carry only a thin stub
 # that calls this workflow; the stub's pin (@SHA after probe passes) is the
 # review gate for logic changes.
+#
+# Per-caller policy (allowlist patterns, persona location, worklog project, repo
+# context blurb) is passed via `workflow_call.inputs` — defaults preserve the
+# original ops-mirror (novacaelum-aaasops) shape for backward compat; app-repo
+# callers (Caelos etc.) pass their own values via `with:` block.
 #
 # Execution context: runs in the CALLER's context — github.* refs, secrets
 # (via `secrets: inherit`), vars, and GITHUB_TOKEN all resolve against the
@@ -25,6 +31,64 @@ name: DevOps-Lead PR Review (reusable)
 
 on:
   workflow_call:
+    # PER-CALLER POLICY INPUTS (added 2026-07-31 — Caelos public-repo consumer).
+    # All inputs are optional and default to the ops-mirror (novacaelum-aaasops)
+    # shape, so existing callers (if/when re-added) continue to work unchanged.
+    # Caelos-shaped caller stubs pass their own values via `with:` block.
+    inputs:
+      persona_source_repo:
+        description: |
+          External repo to check out for the DevOps-Lead persona file. Empty (default)
+          skips the external checkout and relies on the caller's own tree via
+          `.canonical-main` (ops-mirror shape). Set to `Nova-Caelum/devops-lead` (or
+          any repo containing a persona at `persona_path`) to fetch persona from
+          there instead — required for callers that don't carry the ops-mirror layout.
+        type: string
+        default: ''
+      persona_source_ref:
+        description: 'Ref (branch/tag/SHA) to check out `persona_source_repo` at.'
+        type: string
+        default: 'main'
+      persona_path:
+        description: |
+          Path (relative to runner workspace) to the DevOps-Lead persona markdown
+          file. Default reads from the caller's `.canonical-main` checkout at the
+          ops-mirror path; callers using `persona_source_repo` typically pass
+          `.persona-source/.claude/agents/devops-lead.md`.
+        type: string
+        default: '.canonical-main/_agentOS/agent_profiles/devops-lead/devops-lead.md'
+      auto_merge_paths:
+        description: |
+          Multi-line list of glob patterns (or human-readable path descriptions)
+          considered AUTO-MERGE-SAFE for this repo. Rendered verbatim into the
+          reviewer prompt.
+        type: string
+        default: |
+          docs-only markdown, README.md, .gitignore, outputs/**, platform/** (legacy PromptOps scaffold, not live)
+      escalate_paths:
+        description: |
+          Multi-line list of glob patterns (or human-readable path descriptions)
+          that always ESCALATE (never auto-merge) for this repo. Rendered verbatim
+          into the reviewer prompt. "any diff containing credential-shaped strings"
+          and "any diff you cannot confidently classify" are always appended at
+          runtime — do not include them here.
+        type: string
+        default: |
+          _agentOS/rules/**, _agentOS/system/**, _agentOS/skills/**, _agentOS/agent_profiles/** (non-prose / frontmatter changes), .github/workflows/**
+      worklog_project:
+        description: |
+          Free-text worklog project name for the deterministic-bookkeeping step
+          (`project` field on append_worklog). Not a validated project_code —
+          arbitrary strings are accepted.
+        type: string
+        default: 'governance-evolution-sprint'
+      repo_context_description:
+        description: |
+          One-line description of the calling repo, rendered into the reviewer
+          prompt after "reviewing a pull request against `<repo>` — " so the
+          reviewer knows what kind of repo it's looking at.
+        type: string
+        default: 'the git-preservation mirror of the vault _agentOS/ canonical layer (governance-evolution-sprint, 2026-07-17)'
 
 jobs:
   devops-lead-review:
@@ -39,18 +103,36 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout ops repo (PR head)
+      - name: Checkout caller repo (PR head)
         # v6 = df4cb1c069e1874edd31b4311f1884172cec0e10 as of 2026-07-18
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 1
 
-      - name: Checkout canonical main (persona source — tamper-safe from PR head)
+      - name: Checkout caller main (persona source — tamper-safe from PR head; ops-mirror path)
         # v6 = df4cb1c069e1874edd31b4311f1884172cec0e10 as of 2026-07-18
+        # Kept unconditional for backward compat: the ops-mirror caller shape
+        # relies on `.canonical-main/_agentOS/...` and does not pass `persona_source_repo`.
+        # Callers that pass `persona_source_repo` typically point `persona_path`
+        # at the `.persona-source/` checkout below instead — the `.canonical-main`
+        # checkout is then unused but harmless.
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           ref: main
           path: .canonical-main
+          fetch-depth: 1
+
+      - name: Checkout external persona source (optional)
+        # Fires only when the caller passes `persona_source_repo` — Caelos-shape
+        # public-repo consumers use this to fetch the canonical DevOps-Lead persona
+        # from `Nova-Caelum/devops-lead` itself (public since 2026-07-30 to unblock
+        # public→private reusable-workflow resolution — see workspace worklog).
+        if: inputs.persona_source_repo != ''
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: ${{ inputs.persona_source_repo }}
+          ref: ${{ inputs.persona_source_ref }}
+          path: .persona-source
           fetch-depth: 1
 
       - name: DevOps-Lead review
@@ -73,27 +155,22 @@ jobs:
             PR AUTHOR: ${{ github.event.pull_request.user.login }}
 
             You are acting as DevOps-Lead (full persona instructions appended below via
-            --append-system-prompt) reviewing a pull request against `novacaelum-aaasops`
-            — the git-preservation mirror of the vault `_agentOS/` canonical layer
-            (governance-evolution-sprint, 2026-07-17). This is v0.1 MVP: review, classify,
-            comment, and merge-or-escalate. Tonight this workflow is being run as a live
-            production-cycle demo — Daniel is watching one full cycle end-to-end.
+            --append-system-prompt) reviewing a pull request against `${{ github.repository }}`
+            — ${{ inputs.repo_context_description }}. This is v0.1 MVP: review, classify,
+            comment, and merge-or-escalate.
 
             ## Task
-            0. FIRST: Read `.canonical-main/_agentOS/agent_profiles/devops-lead/devops-lead.md`.
+            0. FIRST: Read `${{ inputs.persona_path }}`.
                That file IS your persona and operating instructions (DevOps-Lead). Adopt it
                fully before proceeding — it defines your review discipline, caps, and tone.
             1. Run `gh pr diff ${{ github.event.pull_request.number }}` to see the changed files.
-            2. Classify the diff against this allowlist (adapted from PRD AD-5 for the
-               ops-repo context, where the tracked content is `_agentOS/**` plus repo
-               scaffolding):
-               - AUTO-MERGE-SAFE: docs-only markdown, `README.md`, `.gitignore`,
-                 `outputs/**`, `platform/**` (legacy PromptOps scaffold, not live).
-               - ESCALATE (always, never auto-merge): `_agentOS/rules/**`,
-                 `_agentOS/system/**`, `_agentOS/skills/**`,
-                 `_agentOS/agent_profiles/**` (non-prose / frontmatter changes),
-                 `.github/workflows/**`, any diff containing credential-shaped strings,
-                 any diff you cannot confidently classify.
+            2. Classify the diff against this repo-specific allowlist (passed in via the
+               reusable-workflow inputs — treat as literal policy for THIS repo, do not
+               generalize):
+               - AUTO-MERGE-SAFE: ${{ inputs.auto_merge_paths }}
+               - ESCALATE (always, never auto-merge): ${{ inputs.escalate_paths }}, any
+                 diff containing credential-shaped strings, any diff you cannot
+                 confidently classify.
             3. Self-PR safety (PRD AD-8 / Q4): if PR AUTHOR looks like an automation/bot
                identity rather than a human GitHub user, do NOT auto-merge regardless of
                tier unless the PR carries a `human-approved` label. State this explicitly
@@ -186,7 +263,7 @@ jobs:
             -q '"state=" + .state + " merged=" + (if .mergedAt then "yes" else "no" end) + " labels=" + ([.labels[].name] | join("+") | if . == "" then "none" else . end)' 2>/dev/null || echo "facts-unavailable")
           SUMMARY="PR #${PR} review run ${{ github.run_id }}: step=${{ steps.review.outcome }}, claude=${CLAUDE_STATE}, ${FACTS}"
           SUMMARY=$(printf '%s' "$SUMMARY" | head -c 279)
-          PAYLOAD=$(jq -n --arg s "$SUMMARY" --arg idem "$IDEM_TAG" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"append_worklog",arguments:{author:"devops-lead",project:"governance-evolution-sprint",summary:$s,surface:"claude-cloud",tags:["vault-pr","pr-review","deterministic-bookkeeping",$idem]}}}')
+          PAYLOAD=$(jq -n --arg s "$SUMMARY" --arg idem "$IDEM_TAG" --arg proj "${{ inputs.worklog_project }}" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"append_worklog",arguments:{author:"devops-lead",project:$proj,summary:$s,surface:"claude-cloud",tags:["vault-pr","pr-review","deterministic-bookkeeping",$idem]}}}')
           UUID_REGEX='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
           OK=0
           ROW_ID=""
