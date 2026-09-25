@@ -1,30 +1,67 @@
-# devops-lead cloud-launch repo
+# devops-lead
 
-Per-agent cloud-launch repo for the **DevOps-Lead** persona (Nova Caelum).
+A pull-request reviewer that runs Claude Code inside GitHub Actions. It reads the diff, classifies it against a per-repo policy, and then does one of two things: merges it, or labels it for a human and explains why.
 
-## Purpose
+It is the review gate for Nova Caelum's own repositories. It is published as a working reference, not as a turnkey product.
 
-This repo exists so Daniel can open it in Claude Code (mobile / cloud UI) and get a session running the `devops-lead` persona as main-thread. Empirical test 2026-07-14 (worklog `802ad9fb`) confirmed Cloud UI mobile has no per-session agent-selector; a repo-scoped `.claude/settings.json` with `agent: devops-lead` is the only reliable path.
+## How it works
 
-## Canonical source
+`.github/workflows/devops-lead-pr-review.yml` is a reusable workflow (`on: workflow_call`). A calling repo keeps a short stub workflow that triggers on its pull requests and calls this one. The review runs in the caller's context, with the caller's secrets and `GITHUB_TOKEN`.
 
-The persona file at `.claude/agents/devops-lead.md` is **synced from vault canonical**:
+For each pull request, the reviewer:
 
-- Vault repo: [`NovaCaelum-Founder/novacaelum.co-vault`](https://github.com/NovaCaelum-Founder/novacaelum.co-vault)
-- Canonical path: `AgentSecretBase/_agentOS/agent_profiles/devops-lead/devops-lead.md`
+1. Reads its persona file, which sets its review discipline and tone.
+2. Reads the diff with `gh pr diff`.
+3. Classifies the change against the caller's policy:
+   - **auto-merge-safe** paths, such as docs and README changes
+   - **escalate** paths, such as workflows and configuration. It also always escalates a diff that contains credential-shaped strings, and a diff it cannot confidently classify.
+4. Posts a verdict comment with a one-line change summary and, if it escalates, a one-line reason.
+5. Either queues a squash auto-merge, or applies an escalation label and stops.
 
-**Do NOT edit this repo's persona file directly.** Edits go to the vault canonical layer, then sync to this repo via the `deploy-cloud` script (docket task `2ab3b69a`; interim manual sync until that ships).
+Deterministic workflow steps, not the model, then record the outcome and send the escalation notice.
 
-## Runtime context
+## Guardrails
 
-DevOps-Lead has two runtime substrates:
+- **Narrow tools.** The model may only read files and run `gh pr diff`, `view`, `comment`, `merge`, `edit` and `label create`, plus inline review comments. It cannot run arbitrary shell commands.
+- **No secrets in the model's hands.** Commands that expand environment variables are denied, so the model cannot make authenticated calls itself. Logging and notification run in separate workflow steps, where secrets stay out of the prompt.
+- **Bot pull requests never auto-merge** unless a human has added a `human-approved` label.
+- **Tamper-safe persona.** The persona is read from the caller's default branch or a pinned external ref, never from the pull request under review.
+- **Pinned dependencies.** The Claude Code Action is pinned to a commit SHA, and the model is pinned by name.
 
-1. **`claude-code-action`** (Anthropic-official GitHub Action) — auto-fires on `on: pull_request` against the vault repo (workflow YAML lives in vault at `.github/workflows/devops-lead.yml`).
-2. **Cloud UI (this repo)** — Daniel-opened for interactive review, self-test, or task-queue triage (v0.2+ only).
+## Calling it
 
-## Version
+```yaml
+# .github/workflows/pr-review.yml in the calling repo
+on:
+  pull_request:
+jobs:
+  review:
+    uses: Nova-Caelum/devops-lead/.github/workflows/devops-lead-pr-review.yml@<commit-sha>
+    secrets: inherit
+    with:
+      persona_source_repo: Nova-Caelum/devops-lead
+      persona_path: .persona-source/.claude/agents/devops-lead.md
+      auto_merge_paths: |
+        docs/**, README.md
+      escalate_paths: |
+        .github/workflows/**, src/**
+      repo_context_description: "a small web app"
+```
 
-**v0.1 (LIVE):** PR-review + auto-merge/escalate primary loop + Tertiary self-test.
-**v0.2 (DEFERRED):** Secondary Supabase task-queue triage + `on: schedule` cron + self-review discipline loop.
+Pin to a commit SHA, not `@main`, so a change here is reviewed before it reaches you.
 
-See persona body § "Version status" for full scope map.
+**Required secret:** `CLAUDE_CODE_OAUTH_TOKEN`.
+
+**Adapting it:** the outcome-logging and notification steps are wired to Nova Caelum's internal services. Anyone else running this should replace or remove those two steps.
+
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `.github/workflows/devops-lead-pr-review.yml` | The reusable review workflow |
+| `.claude/agents/devops-lead.md` | The reviewer's persona. It is maintained in a private source and synced here, so edit it at the source rather than in this repo. |
+| `.claude/settings.json` | Opens this repo in Claude Code with the `devops-lead` agent as the main thread |
+
+## Status
+
+v0.1 is live: review, classify, and merge or escalate. Scheduled maintenance runs are on the roadmap.
