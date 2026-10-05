@@ -358,6 +358,43 @@ jobs:
             --max-turns 35
             --allowedTools "Read,Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(${{ runner.temp }}/devops-lead-merge-gate.sh:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh label create:*),mcp__github_inline_comment__create_inline_comment"
 
+      - name: Loud failure (label + comment when the review did not run to completion)
+        # 2026-10-05: a review run that died (e.g. a 429 monthly-spend-limit error, 2026-09-30) went red with
+        # no comment, no label and no notification, and the PR sat unreviewed for days. Any failure up to and
+        # including the review step now labels the PR escalate-daniel (the label the notification step and
+        # Daniel's queue key on) and leaves a one-line comment naming the failure CLASS. Only fixed class
+        # strings are written - never raw error text, never a credential. Does not mask the red job.
+        if: failure()
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+        run: |
+          set -uo pipefail
+          OUT="${RUNNER_TEMP:-/home/runner/work/_temp}/claude-execution-output.json"
+          ERRTEXT=""
+          if [ -f "$OUT" ]; then
+            ERRTEXT=$(jq -r 'if type=="array" then (.[-1].result // .[-1].error // empty) else (.result // .error // empty) end' "$OUT" 2>/dev/null | head -c 600 || true)
+          fi
+          if [ "${REVIEW_OUTCOME:-}" != "failure" ]; then
+            CLASS="a setup step failed before the review started (checkout or merge-gate install)"
+          elif printf '%s' "$ERRTEXT" | grep -qiE '429|rate.?limit|spend limit|usage limit|monthly|quota|credit|billing|overloaded'; then
+            CLASS="Anthropic spend, usage or rate limit (429)"
+          elif printf '%s' "$ERRTEXT" | grep -qiE '401|403|oauth|unauthori[sz]ed|forbidden|invalid.{0,20}token'; then
+            CLASS="Anthropic authentication rejected (401/403)"
+          elif printf '%s' "$ERRTEXT" | grep -qi 'error_max_turns'; then
+            CLASS="the review hit its turn limit"
+          elif [ ! -f "$OUT" ]; then
+            CLASS="the review action failed before Claude produced any output (see the run log; commonly a spend limit, auth or startup error)"
+          else
+            CLASS="the review action errored (see the run log)"
+          fi
+          echo "::error::DEVOPS_LEAD_REVIEW_FAILED ${CLASS} - PR #${PR} was not reviewed; labelled escalate-daniel"
+          gh label create escalate-daniel --color FBCA04 2>/dev/null || true
+          gh pr edit "$PR" --add-label escalate-daniel || echo "::error::could not apply the escalate-daniel label"
+          gh pr comment "$PR" --body "DevOps-Lead review did not run to completion: ${CLASS}. This PR has NOT been reviewed or merged; re-run the job: ${RUN_URL}" \
+            || echo "::error::could not post the failure comment"
+
       # Deterministic bookkeeping (2026-07-18): the model CANNOT do secret-bearing curl
       # (permission evaluator denies env-var expansion — "Contains simple_expansion";
       # stress-test evidence PR #3/#4). Worklog + escalation-Telegram therefore live in
