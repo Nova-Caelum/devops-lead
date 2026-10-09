@@ -89,11 +89,19 @@ on:
           reviewer knows what kind of repo it's looking at.
         type: string
         default: 'the git-preservation mirror of the vault _agentOS/ canonical layer (governance-evolution-sprint, 2026-07-17)'
+      ci_wait_minutes:
+        description: |
+          Merge gate: the longest the reviewer waits for OTHER CI workflow runs on the PR head to
+          finish before refusing to merge (it then escalates instead). Clamped to 40. The gate never
+          merges while any other run on that exact commit is unfinished or unsuccessful.
+        type: string
+        default: '30'
 
 jobs:
   devops-lead-review:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 15 min of review + up to 40 min of merge-gate CI wait (ci_wait_minutes is clamped to 40).
+    timeout-minutes: 60
     permissions:
       contents: write
       pull-requests: write
@@ -135,6 +143,129 @@ jobs:
           path: .persona-source
           fetch-depth: 1
 
+      - name: Install merge gate (the reviewer's only merge path)
+        # 2026-10-05, brief devops-ci-gate: `gh pr merge --auto` merges at once when the base branch has no
+        # REQUIRED checks (gh treats CLEAN/UNSTABLE as immediately mergeable), and the model also asserted
+        # "CI green" while jobs were still running (technical-cofounder PR #26). The model no longer has
+        # `gh pr merge`; it can only call this script, which refuses unless every other CI workflow run on the
+        # exact head commit is complete and successful. The merge itself still runs inside the action, so it is
+        # still made by the Claude app identity and post-merge push workflows still fire (a GITHUB_TOKEN merge
+        # would not trigger them, and the action revokes its app token when its step ends).
+        env:
+          CI_WAIT_MINUTES: ${{ inputs.ci_wait_minutes }}
+        run: |
+          set -euo pipefail
+          GATE="${{ runner.temp }}/devops-lead-merge-gate.sh"
+          cat > "$GATE" <<'GATE_EOF'
+          #!/usr/bin/env bash
+          # DevOps-Lead merge gate - the reviewer's ONLY merge path (`gh pr merge` is not in its allowedTools).
+          # Usage: devops-lead-merge-gate.sh <owner/repo> <pr-number> <head-sha> <this-run-id>
+          # Merges ONLY when every OTHER workflow run on that exact commit has completed successfully, waiting
+          # (bounded) for runs still in flight. Never uses --admin. The last output line is always GATE=<outcome>.
+          set -uo pipefail
+
+          REPO="${1:-}"; PR="${2:-}"; HEAD_SHA="${3:-}"; SELF_RUN="${4:-0}"
+          WAIT_MIN="${DEVOPS_LEAD_CI_WAIT_MINUTES:-30}"
+          POLL_SEC="${DEVOPS_LEAD_GATE_POLL_SEC:-30}"
+
+          gate_out() { echo "GATE=$1${2:+ - $2}"; }
+
+          # Prints "<n failed>|<n pending>|<n runs>|<failed names>|<pending names>"; returns 1 if CI state is unreadable.
+          # Counts every workflow run on the head commit except this run and any DevOps-Lead review run; if a
+          # workflow ran more than once for the same event on this commit, only its newest run counts.
+          ci_state() {
+            local resp
+            resp=$(gh api "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" 2>/dev/null) || return 1
+            printf '%s' "$resp" | jq -e -r --argjson self "$SELF_RUN" '
+              def nm: ((.name // "?") | gsub("[^A-Za-z0-9 ._()/+-]"; "") | .[0:60]);
+              if (.total_count // 0) > 100 then error("more runs than one page") else . end
+              | [ .workflow_runs[]
+                  | select(.id != $self)
+                  | select(((.path // "") | test("devops-lead-pr-review")) | not)
+                  | select((.name // "") != "DevOps-Lead PR Review") ]
+              | group_by((.path // .name // "?") + "|" + (.event // "?"))
+              | map(max_by(.id)) as $runs
+              | [ $runs[] | (.conclusion // "") as $c
+                  | select(.status == "completed" and ((["success", "neutral", "skipped"] | index($c)) == null))
+                  | (nm + "=" + (.conclusion // "?")) ] as $failed
+              | [ $runs[] | select(.status != "completed") | (nm + "=" + (.status // "?")) ] as $pending
+              | "\($failed | length)|\($pending | length)|\($runs | length)|\($failed | join(", "))|\($pending | join(", "))"
+            ' 2>/dev/null
+          }
+
+          # Prints "<state> <headRefOid> <comma-joined labels>"; returns 1 if unreadable.
+          pr_info() {
+            gh pr view "$PR" --repo "$REPO" --json state,headRefOid,labels \
+              -q '[.state, .headRefOid, ([.labels[].name] | join(","))] | join(" ")' 2>/dev/null
+          }
+
+          main() {
+            [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { gate_out refused "bad repo argument"; return 2; }
+            [[ "$PR" =~ ^[0-9]+$ ]] || { gate_out refused "bad PR number"; return 2; }
+            [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { gate_out refused "bad head SHA"; return 2; }
+            [[ "$SELF_RUN" =~ ^[0-9]+$ ]] || SELF_RUN=0
+            [[ "$WAIT_MIN" =~ ^[0-9]+$ ]] || WAIT_MIN=30
+            (( WAIT_MIN > 40 )) && WAIT_MIN=40
+            [[ "$POLL_SEC" =~ ^[0-9]+$ ]] || POLL_SEC=30
+
+            local info state cur labels
+            info=$(pr_info) || { gate_out refused "cannot read the PR"; return 3; }
+            read -r state cur labels <<<"$info"
+            [[ "$state" == "OPEN" ]] || { gate_out refused "PR is $state, not OPEN"; return 3; }
+            [[ "$cur" == "$HEAD_SHA" ]] || { gate_out refused "head moved since this review began (a newer review run handles the new commit)"; return 3; }
+            case ",${labels:-}," in *,escalate-daniel,*) gate_out refused "PR is labelled escalate-daniel"; return 3 ;; esac
+
+            local deadline st nfail npend nruns failed pending
+            deadline=$(( $(date +%s) + WAIT_MIN * 60 ))
+            while :; do
+              st=""
+              for _ in 1 2 3; do
+                st=$(ci_state) && break
+                st=""; sleep $(( POLL_SEC < 5 ? POLL_SEC : 5 ))
+              done
+              [[ -n "$st" ]] || { gate_out refused "CI state unreadable from the Actions API - failing closed"; return 3; }
+              IFS='|' read -r nfail npend nruns failed pending <<<"$st"
+              (( nfail > 0 )) && { gate_out refused "CI failed: $failed"; return 3; }
+              (( npend == 0 )) && break
+              (( $(date +%s) >= deadline )) && { gate_out refused "CI still running after ${WAIT_MIN} min: $pending"; return 3; }
+              echo "waiting on CI - ${npend} still running: ${pending}"
+              sleep "$POLL_SEC"
+            done
+
+            info=$(pr_info) || { gate_out refused "cannot re-read the PR before merging"; return 3; }
+            read -r state cur labels <<<"$info"
+            [[ "$state" == "OPEN" && "$cur" == "$HEAD_SHA" ]] || { gate_out refused "PR changed while waiting (state=$state, head moved: $([[ $cur == "$HEAD_SHA" ]] && echo no || echo yes))"; return 3; }
+            case ",${labels:-}," in *,escalate-daniel,*) gate_out refused "PR was labelled escalate-daniel while waiting"; return 3 ;; esac
+
+            echo "CI complete and green on ${HEAD_SHA:0:12} (${nruns} other workflow run(s) checked)"
+            local out rc
+            out=$(gh pr merge "$PR" --repo "$REPO" --auto --squash --match-head-commit "$HEAD_SHA" 2>&1); rc=$?
+            if (( rc != 0 )); then
+              gate_out merge-failed "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"; return 4
+            fi
+            local after
+            after=$(gh pr view "$PR" --repo "$REPO" --json state,autoMergeRequest \
+              -q '.state + " " + (if .autoMergeRequest then "queued" else "none" end)' 2>/dev/null) || after="unknown"
+            case "$after" in
+              MERGED*) gate_out merged ;;
+              "OPEN queued") gate_out merge-queued "auto-merge enabled; GitHub merges when its own merge requirements are met" ;;
+              *) gate_out merge-failed "merge command succeeded but PR state reads: $after"; return 4 ;;
+            esac
+          }
+
+          if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then main "$@"; fi
+          GATE_EOF
+          chmod 0755 "$GATE"
+          WAIT="${CI_WAIT_MINUTES:-30}"
+          [[ "$WAIT" =~ ^[0-9]+$ ]] || WAIT=30
+          [ "$WAIT" -gt 40 ] && WAIT=40
+          # Seen by the model's Bash tool: the gate may block for the CI wait, so lift the tool timeout above it.
+          {
+            echo "DEVOPS_LEAD_CI_WAIT_MINUTES=$WAIT"
+            echo "BASH_DEFAULT_TIMEOUT_MS=$(( (WAIT + 5) * 60000 ))"
+            echo "BASH_MAX_TIMEOUT_MS=$(( (WAIT + 5) * 60000 ))"
+          } >> "$GITHUB_ENV"
+
       - name: DevOps-Lead review
         id: review
         # v1 = 3553f84341b92da26052e28acf1aa898f9511f32 (v1.0.177) as of 2026-07-18
@@ -153,6 +284,8 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
             PR AUTHOR: ${{ github.event.pull_request.user.login }}
+            PR HEAD SHA: ${{ github.event.pull_request.head.sha }}
+            RUN ID: ${{ github.run_id }}
 
             You are acting as DevOps-Lead (full persona instructions appended below via
             --append-system-prompt) reviewing a pull request against `${{ github.repository }}`
@@ -180,16 +313,30 @@ jobs:
                these are NOT hard-metered by the job (see workflow file header comment);
                keep your own review proportionate to a small-diff maintenance PR.
             5. Post your verdict as a PR comment via `gh pr comment` — state the tier,
-               your rationale, and whether you attempted a merge. Your comment MUST
+               your rationale, and whether you are requesting a merge (the gate in step 6 decides).
+               Do NOT state or imply that CI has passed; you do not verify CI, the gate does. Your comment MUST
                include, on its own line, `CHANGE-SUMMARY: <one sentence describing what
                this PR changes>`. If (and only if) this PR is ESCALATE tier, also include
                a line `ESCALATION-REASON: <one sentence on what Daniel needs to review and
                why it matters>`. A later deterministic workflow step parses these exact
                marker lines to build Daniel's Telegram notification — use the literal
                marker text verbatim, one sentence each, no markdown around the marker.
-            6. If AUTO-MERGE-SAFE and not self-PR-blocked: run
-               `gh pr merge ${{ github.event.pull_request.number }} --auto --squash`.
-            7. If ESCALATE: apply the escalation label via
+            6. If AUTO-MERGE-SAFE and not self-PR-blocked: request the merge by running exactly this
+               one command, with no pipes, no variables and no extra arguments:
+               `${{ runner.temp }}/devops-lead-merge-gate.sh ${{ github.repository }} ${{ github.event.pull_request.number }} ${{ github.event.pull_request.head.sha }} ${{ github.run_id }}`
+               This is your ONLY way to merge. `gh pr merge` is not available to you and must never be
+               attempted; this step supersedes any persona text about running it or about GitHub
+               waiting for CI. The gate merges only when every other CI workflow run on this exact
+               commit has completed successfully, waiting for runs still in flight (it can take many
+               minutes — wait for it to return). Its last output line is `GATE=<outcome>`. Never retry
+               it, never work around it, and quote its GATE line rather than describing CI yourself.
+               - `GATE=merged` or `GATE=merge-queued`: done.
+               - `GATE=refused - head moved ...`: nothing more to do; a newer review run handles it.
+               - any other `GATE=refused ...` or `GATE=merge-failed ...`: the PR is NOT merged — treat
+                 it as ESCALATE (step 7) and use the gate's reason as the ESCALATION-REASON.
+            7. If ESCALATE (a refusing gate counts: first post one short extra `gh pr comment` whose
+               only content is a line `ESCALATION-REASON: <the gate's reason in one sentence>`): apply
+               the escalation label via
                `gh pr edit ${{ github.event.pull_request.number }} --add-label escalate-daniel`
                (create the label first with `gh label create` if it doesn't exist yet,
                ignore the error if it already does). Do NOT attempt any Telegram call or
@@ -202,14 +349,51 @@ jobs:
                to write the worklog yourself. Your job ends at: comment posted +
                merge-or-label executed.
 
-            Never claim you merged a PR you did not actually run `gh pr merge` on. Never
+            Never claim you merged a PR unless the gate printed `GATE=merged`. Never
             print secret values (or anything derived from them) to any comment, log line,
             or commit message.
 
           claude_args: |
             --model claude-sonnet-5
             --max-turns 35
-            --allowedTools "Read,Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr merge:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh label create:*),mcp__github_inline_comment__create_inline_comment"
+            --allowedTools "Read,Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(${{ runner.temp }}/devops-lead-merge-gate.sh:*),Bash(gh pr edit:*),Bash(gh pr view:*),Bash(gh label create:*),mcp__github_inline_comment__create_inline_comment"
+
+      - name: Loud failure (label + comment when the review did not run to completion)
+        # 2026-10-05: a review run that died (e.g. a 429 monthly-spend-limit error, 2026-09-30) went red with
+        # no comment, no label and no notification, and the PR sat unreviewed for days. Any failure up to and
+        # including the review step now labels the PR escalate-daniel (the label the notification step and
+        # Daniel's queue key on) and leaves a one-line comment naming the failure CLASS. Only fixed class
+        # strings are written - never raw error text, never a credential. Does not mask the red job.
+        if: failure()
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+        run: |
+          set -uo pipefail
+          OUT="${RUNNER_TEMP:-/home/runner/work/_temp}/claude-execution-output.json"
+          ERRTEXT=""
+          if [ -f "$OUT" ]; then
+            ERRTEXT=$(jq -r 'if type=="array" then (.[-1].result // .[-1].error // empty) else (.result // .error // empty) end' "$OUT" 2>/dev/null | head -c 600 || true)
+          fi
+          if [ "${REVIEW_OUTCOME:-}" != "failure" ]; then
+            CLASS="a setup step failed before the review started (checkout or merge-gate install)"
+          elif printf '%s' "$ERRTEXT" | grep -qiE '429|rate.?limit|spend limit|usage limit|monthly|quota|credit|billing|overloaded'; then
+            CLASS="Anthropic spend, usage or rate limit (429)"
+          elif printf '%s' "$ERRTEXT" | grep -qiE '401|403|oauth|unauthori[sz]ed|forbidden|invalid.{0,20}token'; then
+            CLASS="Anthropic authentication rejected (401/403)"
+          elif printf '%s' "$ERRTEXT" | grep -qi 'error_max_turns'; then
+            CLASS="the review hit its turn limit"
+          elif [ ! -f "$OUT" ]; then
+            CLASS="the review action failed before Claude produced any output (see the run log; commonly a spend limit, auth or startup error)"
+          else
+            CLASS="the review action errored (see the run log)"
+          fi
+          echo "::error::DEVOPS_LEAD_REVIEW_FAILED ${CLASS} - PR #${PR} was not reviewed; labelled escalate-daniel"
+          gh label create escalate-daniel --color FBCA04 2>/dev/null || true
+          gh pr edit "$PR" --add-label escalate-daniel || echo "::error::could not apply the escalate-daniel label"
+          gh pr comment "$PR" --body "DevOps-Lead review did not run to completion: ${CLASS}. This PR has NOT been reviewed or merged; re-run the job: ${RUN_URL}" \
+            || echo "::error::could not post the failure comment"
 
       # Deterministic bookkeeping (2026-07-18): the model CANNOT do secret-bearing curl
       # (permission evaluator denies env-var expansion — "Contains simple_expansion";
