@@ -69,9 +69,9 @@ on:
         description: |
           Multi-line list of glob patterns (or human-readable path descriptions)
           that always ESCALATE (never auto-merge) for this repo. Rendered verbatim
-          into the reviewer prompt. "any diff containing credential-shaped strings"
-          and "any diff you cannot confidently classify" are always appended at
-          runtime — do not include them here.
+          into the reviewer prompt. Credential-shaped strings always escalate.
+          Numbered judgment-based lists override the persona's _agentOS list;
+          uncertainty holds apply to security conditions, not ordinary path changes.
         type: string
         default: |
           _agentOS/rules/**, _agentOS/system/**, _agentOS/skills/**, _agentOS/agent_profiles/** (non-prose / frontmatter changes), .github/workflows/**
@@ -284,6 +284,7 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
             PR AUTHOR: ${{ github.event.pull_request.user.login }}
+            PR AUTHOR TYPE: ${{ github.event.pull_request.user.type }}
             PR HEAD SHA: ${{ github.event.pull_request.head.sha }}
             RUN ID: ${{ github.run_id }}
 
@@ -297,17 +298,20 @@ jobs:
                That file IS your persona and operating instructions (DevOps-Lead). Adopt it
                fully before proceeding — it defines your review discipline, caps, and tone.
             1. Run `gh pr diff ${{ github.event.pull_request.number }}` to see the changed files.
-            2. Classify the diff against this repo-specific allowlist (passed in via the
-               reusable-workflow inputs — treat as literal policy for THIS repo, do not
-               generalize):
+            2. Classify the diff against this repo-specific policy (passed in via the
+               reusable-workflow inputs — this repo's escalate list takes precedence
+               over the persona's _agentOS-specific list):
                - AUTO-MERGE-SAFE: ${{ inputs.auto_merge_paths }}
-               - ESCALATE (always, never auto-merge): ${{ inputs.escalate_paths }}, any
-                 diff containing credential-shaped strings, any diff you cannot
-                 confidently classify.
-            3. Self-PR safety (PRD AD-8 / Q4): if PR AUTHOR looks like an automation/bot
-               identity rather than a human GitHub user, do NOT auto-merge regardless of
-               tier unless the PR carries a `human-approved` label. State this explicitly
-               in your comment if it applies.
+               - ESCALATE (always, never auto-merge): ${{ inputs.escalate_paths }}
+               Credential-shaped strings always escalate. For a numbered judgment-based
+               policy, merge when no listed condition applies; uncertainty alone holds
+               only for the security conditions. Apply explicit repo-specific path holds
+               literally; do not invent additional path holds.
+            3. Self-PR safety (PRD AD-8 / Q4): hold ONLY when PR AUTHOR TYPE is exactly
+               `Bot`, unless the PR carries a `human-approved` label. A `User` author is
+               not self-PR-blocked, including agent-authored work submitted by a human
+               account. Do not infer bot status from login, labels, PR text or commit
+               authorship. State the hold explicitly in your comment if it applies.
             4. Cost/safety caps: read `DEVOPS_LEAD_PR_INPUT_TOKEN_CAP` /
                `_OUTPUT_TOKEN_CAP` / `_MONTHLY_BUDGET_USD` from env and reason about them —
                these are NOT hard-metered by the job (see workflow file header comment);
@@ -361,8 +365,8 @@ jobs:
       - name: Loud failure (label + comment when the review did not run to completion)
         # 2026-10-05: a review run that died (e.g. a 429 monthly-spend-limit error, 2026-09-30) went red with
         # no comment, no label and no notification, and the PR sat unreviewed for days. Any failure up to and
-        # including the review step now labels the PR escalate-daniel (the label the notification step and
-        # Daniel's queue key on) and leaves a one-line comment naming the failure CLASS. Only fixed class
+        # including the review step now labels the PR review-failed and leaves a one-line comment
+        # naming the failure CLASS. Infrastructure failures stay separate from verdicts. Only fixed class
         # strings are written - never raw error text, never a credential. Does not mask the red job.
         if: failure()
         env:
@@ -389,9 +393,9 @@ jobs:
           else
             CLASS="the review action errored (see the run log)"
           fi
-          echo "::error::DEVOPS_LEAD_REVIEW_FAILED ${CLASS} - PR #${PR} was not reviewed; labelled escalate-daniel"
-          gh label create escalate-daniel --color FBCA04 2>/dev/null || true
-          gh pr edit "$PR" --add-label escalate-daniel || echo "::error::could not apply the escalate-daniel label"
+          echo "::error::DEVOPS_LEAD_REVIEW_FAILED ${CLASS} - PR #${PR} was not reviewed; labelled review-failed"
+          gh label create review-failed --color D93F0B 2>/dev/null || true
+          gh pr edit "$PR" --add-label review-failed || echo "::error::could not apply the review-failed label"
           gh pr comment "$PR" --body "DevOps-Lead review did not run to completion: ${CLASS}. This PR has NOT been reviewed or merged; re-run the job: ${RUN_URL}" \
             || echo "::error::could not post the failure comment"
 
@@ -427,12 +431,14 @@ jobs:
           PR=${{ github.event.pull_request.number }}
           REPO_SLUG="${{ github.event.repository.name }}"
           IDEM_TAG="idem:${REPO_SLUG}-pr${PR}-${{ github.run_id }}"
-          # Did Claude actually run? On workflow-change PRs the action self-skips
+          # Did Claude actually run? Failed setup/review runs use review-failed;
+          # only a successful action with no output is a validation-skip escalation.
+          # On workflow-change PRs the action self-skips
           # ("workflow validation") but the step still reports success — the
           # execution-output file is the discriminator (false-green detector).
-          if [ -f /home/runner/work/_temp/claude-execution-output.json ]; then
+          if [ -f "${RUNNER_TEMP:-/home/runner/work/_temp}/claude-execution-output.json" ]; then
             CLAUDE_STATE="ran"
-          else
+          elif [ "${{ steps.review.outcome }}" = "success" ]; then
             CLAUDE_STATE="validation-skip (action never launched Claude — likely workflow-change PR)"
             # LAYER ONE (2026-07-18, Daniel-approved): the reviewer cannot review
             # changes to its own definition — the action skips the model on
@@ -442,6 +448,8 @@ jobs:
             # awaiting human review. No branches/PRs are ever auto-created.
             gh label create escalate-daniel --color FBCA04 2>/dev/null || true
             gh pr edit "$PR" --add-label escalate-daniel 2>/dev/null || true
+          else
+            CLAUDE_STATE="not-started-or-failed (see review-failed and run log)"
           fi
           FACTS=$(gh pr view "$PR" --json state,mergedAt,labels \
             -q '"state=" + .state + " merged=" + (if .mergedAt then "yes" else "no" end) + " labels=" + ([.labels[].name] | join("+") | if . == "" then "none" else . end)' 2>/dev/null || echo "facts-unavailable")
