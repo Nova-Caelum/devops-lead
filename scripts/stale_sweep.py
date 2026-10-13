@@ -3,7 +3,10 @@
 import argparse
 from collections import Counter
 from datetime import datetime, timezone, timedelta
-import hashlib
+import base64
+import re
+import subprocess
+from urllib.parse import quote
 import json
 import os
 from pathlib import Path
@@ -14,7 +17,7 @@ import uuid
 
 OPS = 'https://nova-caelum-ops-production.up.railway.app/mcp'
 TERMINAL = {'done', 'completed', 'closed', 'archived', 'descoped', 'killed'}
-INVENTORY = '.stale-sweep-inventory.json'
+
 
 
 def rpc(name, args, token):
@@ -58,39 +61,7 @@ def timestamp(value):
         return None
 
 
-def pointer(value, vault):
-    if not value or not str(value).strip():
-        return 'missing'
-    if vault is None:
-        return 'unverified: no local vault mounted'
-    raw = str(value).strip()
-    # Only resolve paths inside the explicitly supplied vault. Never probe arbitrary hosts.
-    if any(part in raw for part in (' + ', ' (', '\n')):
-        return 'unverified: composite pointer'
-    marker = 'NovaCaelum_Obs/'
-    if marker in raw:
-        raw = raw.split(marker, 1)[1]
-    elif raw.startswith(('~', '/')):
-        return 'unverified: outside vault'
-    path = (vault / raw).resolve()
-    if not path.is_relative_to(vault.resolve()):
-        return 'unverified: outside vault'
-    return 'exists' if path.is_dir() else 'broken'
-
-
-def catalog_inventory(catalog):
-    files = []
-    for path in sorted(catalog.rglob('*')):
-        if path.is_symlink() or not path.is_file() or path.name == INVENTORY:
-            continue
-        if any(p.startswith('.') or p == 'node_modules' for p in path.relative_to(catalog).parts):
-            continue
-        files.append({'path': str(path.relative_to(catalog)), 'bytes': path.stat().st_size,
-                      'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
-    return {'schema_version': 1, 'files': files}
-
-
-def census(data, vault=None, now=None, days=14, write_inventory=False):
+def census(data, now=None, days=14):
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
     findings = []; gaps = list(data.get('coverage_gaps', [])); counts = {}
@@ -107,66 +78,12 @@ def census(data, vault=None, now=None, days=14, write_inventory=False):
                 elif updated is None:
                     findings.append({'kind': 'timestamp-missing', 'surface': kind, 'id': ident})
             if kind != 'list_work_items' and state not in TERMINAL:
-                check = pointer(row.get('folder_path'), vault)
-                if check != 'exists':
-                    findings.append({'kind': 'folder-' + check, 'surface': kind, 'id': ident,
-                                     'pointer': row.get('folder_path')})
+                if not str(row.get('folder_path') or '').strip():
+                    findings.append({'kind': 'folder-missing', 'surface': kind, 'id': ident})
                 if kind == 'list_modules' and not row.get('code_repo'):
                     findings.append({'kind': 'code-repo-missing', 'surface': kind, 'id': ident})
-    if vault is None:
-        gaps += ['catalog and local loop states unavailable on hosted runner',
-                 'folder existence needs a mounted vault; missing pointers remain detectable']
-    else:
-        workspace = vault / 'AgentSecretBase/workspace'
-        loops = sorted(workspace.rglob('loop.state.json')) if workspace.is_dir() else []
-        counts['local_loops'] = len(loops)
-        if not workspace.is_dir(): gaps.append('workspace missing from supplied vault')
-        for path in loops:
-            if path.is_symlink(): continue
-            try: row = json.loads(path.read_text())
-            except (OSError, ValueError):
-                findings.append({'kind': 'invalid-loop-json', 'path': str(path.relative_to(vault))}); continue
-            if row.get('status') in TERMINAL or row.get('status') == 'paused': continue
-            # This is evidence of last recorded activity, not proof nobody is working.
-            dates = [timestamp(row.get('updated_at'))]
-            for entry in row.get('trail', []):
-                dates.extend(timestamp(entry.get(k)) for k in ('entered_at', 'exited_at'))
-            latest = max((d for d in dates if d is not None), default=None)
-            if latest is None or latest < cutoff:
-                findings.append({'kind': 'loop-review-candidate', 'path': str(path.relative_to(vault)),
-                                 'status': row.get('status'), 'last_recorded_activity': latest.isoformat() if latest else None})
-        catalog = vault / 'AgentSecretBase/catalog'
-        if catalog.is_dir():
-            if not catalog.resolve().is_relative_to(vault.resolve()):
-                raise ValueError('catalog must be inside supplied vault')
-            inventory = catalog_inventory(catalog)
-            target = catalog / INVENTORY
-            serialized = json.dumps(inventory, indent=2, ensure_ascii=False) + '\n'
-            changed = not target.exists() or target.read_text() != serialized
-            counts['catalog_files'] = len(inventory['files'])
-            if changed:
-                findings.append({'kind': 'catalog-inventory-regenerated' if write_inventory else 'catalog-inventory-stale'})
-                if write_inventory:
-                    # Only this generated file is repaired. Human index/archive content is untouched.
-                    if target.is_symlink(): raise ValueError('inventory must not be a symlink')
-                    target.write_text(serialized)
-        else: gaps.append('catalog missing from supplied vault')
-    gaps.append('dashboard HTTP probe cannot establish authenticated UI/data freshness')
     return {'observed_at': now.isoformat(), 'candidate_age_days': days, 'counts': counts,
             'coverage_gaps': gaps, 'findings': findings}
-
-
-def dashboard_probe():
-    # Fixed public URL, no ops credential; redirects indicate an access gate, not UI health.
-    class NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *args, **kwargs): return None
-    try:
-        with urllib.request.build_opener(NoRedirect).open('https://task.novacaelum.com', timeout=15) as resp:
-            return {'http_status': resp.status, 'ui_freshness': 'unverified'}
-    except urllib.error.HTTPError as exc:
-        return {'http_status': exc.code, 'ui_freshness': 'unverified'}
-    except Exception as exc:
-        return {'error': type(exc).__name__, 'ui_freshness': 'unverified'}
 
 
 def post_report(report, token):
@@ -177,32 +94,129 @@ def post_report(report, token):
     detail = {**report, 'finding_counts': dict(kinds), 'findings': report['findings'][:25],
               'omitted_findings': max(0, len(report['findings']) - 25)}
     result = rpc('append_worklog', {'author': 'devops-lead', 'project': 'governance-evolution-sprint',
-        'summary': summary[:500], 'detailed': json.dumps(detail, ensure_ascii=False),
+        'summary': summary[:280], 'detailed': json.dumps(detail, ensure_ascii=False),
         'tags': ['daily-stale-sweep', 'row-22', 'review-candidates']}, token)
     uuid.UUID(result['id']) # A success response without a persisted row ID is not sufficient.
+
+
+
+def gh_json(*args):
+    proc = subprocess.run(['gh', *args], check=True, capture_output=True, text=True, timeout=45)
+    return json.loads(proc.stdout)
+
+
+def api(path):
+    return gh_json('api', path)
+
+
+def content(repo, path, ref):
+    result = api(f'repos/{repo}/contents/{quote(path, safe="/")}?ref={quote(ref, safe="")}')
+    return json.loads(base64.b64decode(result['content']))
+
+
+def catalog_findings(repo, branch, manifest):
+    findings = []
+    plugins = manifest.get('plugins')
+    if not isinstance(plugins, list) or not plugins:
+        raise ValueError('catalog has no plugins')
+    for plugin in plugins:
+        name, source = plugin['name'], plugin['source']
+        if isinstance(source, str) and source.startswith('./') and '..' not in source.split('/'):
+            path = source[2:].rstrip('/')
+            content(repo, (path + '/' if path else '') + '.claude-plugin/plugin.json', branch)
+            continue  # Relative source follows this catalog's branch; it has no immutable pin.
+        if not isinstance(source, dict):
+            findings.append({'kind': 'catalog-source-unverified', 'repo': repo, 'plugin': name})
+            continue
+        match = re.fullmatch(r'https://github.com/([\w.-]+/[\w.-]+?)(?:\.git)?', source.get('url', ''))
+        pin, path = source.get('sha', ''), source.get('path', '').strip('/')
+        if not match or source.get('source') != 'git-subdir' or not re.fullmatch(r'[0-9a-fA-F]{40}', pin) or '..' in path.split('/'):
+            findings.append({'kind': 'catalog-pin-unverified', 'repo': repo, 'plugin': name})
+            continue
+        target = match.group(1)
+        # Resolve the advertised artifact at the exact pin; never execute it or auto-bump a release.
+        content(target, (path + '/' if path else '') + '.claude-plugin/plugin.json', pin)
+        default = api(f'repos/{target}')['default_branch']
+        comparison = api(f'repos/{target}/compare/{pin}...{quote(default, safe="")}?per_page=1')
+        files = comparison.get('files', [])
+        prefix = path + '/' if path else ''
+        relevant = [f['filename'] for f in files if f['filename'].startswith(prefix) or f.get('previous_filename', '').startswith(prefix)]
+        if relevant or comparison.get('status') in {'diverged', 'behind'}:
+            findings.append({'kind': 'catalog-pin-review-candidate', 'repo': repo, 'plugin': name,
+                             'pin': pin, 'comparison': comparison.get('status'), 'changed_paths': relevant[:10]})
+        if len(files) >= 300:
+            findings.append({'kind': 'catalog-comparison-truncated', 'repo': repo, 'plugin': name})
+    return findings
+
+
+def github_census(config, now=None, days=14):
+    now = now or datetime.now(timezone.utc)
+    findings, gaps = [], []
+    counts = {'github_repositories': 0, 'open_prs': 0, 'catalogs': 0}
+    failed = False
+    for entry in config['repositories']:
+        repo = entry['repo']
+        if not re.fullmatch(r'[\w.-]+/[\w.-]+', repo): raise ValueError('invalid repository')
+        try:
+            branch = api(f'repos/{repo}')['default_branch']
+            prs = gh_json('pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100',
+                          '--json', 'number,updatedAt,isDraft,statusCheckRollup,headRefOid')
+            counts['github_repositories'] += 1
+            counts['open_prs'] += len(prs)
+            if len(prs) == 100: gaps.append(repo + ': open PR list capped at 100')
+            for pr in prs:
+                updated = timestamp(pr['updatedAt'])
+                if updated and updated < now - timedelta(days=days):
+                    findings.append({'kind': 'stale-pr-candidate', 'repo': repo, 'pr': pr['number'], 'draft': pr['isDraft']})
+                checks = pr.get('statusCheckRollup') or []
+                red = [c.get('name', c.get('context')) for c in checks
+                       if (c.get('conclusion') or c.get('state')) in {'FAILURE', 'ERROR', 'TIMED_OUT', 'ACTION_REQUIRED', 'CANCELLED'}]
+                if red: findings.append({'kind': 'pr-ci-failed', 'repo': repo, 'pr': pr['number'], 'sha': pr['headRefOid'], 'checks': red})
+            runs = api(f'repos/{repo}/actions/runs?branch={quote(branch, safe="")}&per_page=100')['workflow_runs']
+            latest = {}
+            for run in runs: latest.setdefault(run['workflow_id'], run)
+            for run in latest.values():
+                if run.get('conclusion') in {'failure', 'timed_out', 'action_required', 'cancelled'}:
+                    findings.append({'kind': 'default-branch-ci-failed', 'repo': repo, 'run': run['id'], 'url': run['html_url']})
+            if len(runs) == 100: gaps.append(repo + ': only latest 100 default-branch runs checked')
+        except Exception as exc:
+            failed = True
+            gaps.append(repo + ': GitHub PR/CI read failed (' + type(exc).__name__ + ')')
+        if entry.get('catalog'):
+            try:
+                # Resolve independently even if the PR/CI query failed.
+                branch = api(f'repos/{repo}')['default_branch']
+                manifest = content(repo, entry['catalog'], branch)
+                findings.extend(catalog_findings(repo, branch, manifest))
+                counts['catalogs'] += 1
+            except Exception as exc:
+                failed = True
+                gaps.append(repo + ': catalog read/resolve failed (' + type(exc).__name__ + ')')
+    return {'counts': counts, 'findings': findings, 'coverage_gaps': gaps, 'failed': failed}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--snapshot', type=Path)
-    parser.add_argument('--vault-root', type=Path)
+    parser.add_argument('--github-config', type=Path, default=Path(__file__).with_name('stale_sweep_repos.json'))
     parser.add_argument('--report', type=Path, required=True)
     parser.add_argument('--days', type=int, default=14)
-    parser.add_argument('--write-catalog-inventory', action='store_true')
     parser.add_argument('--post', action='store_true')
     args = parser.parse_args()
     if args.days < 1: parser.error('--days must be positive')
-    if args.write_catalog_inventory and args.vault_root is None: parser.error('inventory writes require --vault-root')
     try:
         data = json.loads(args.snapshot.read_text()) if args.snapshot else snapshot(os.environ.get('STALE_SWEEP_READ_TOKEN'))
-        report = census(data, args.vault_root, days=args.days, write_inventory=args.write_catalog_inventory)
-        report['dashboard'] = dashboard_probe()
+        report = census(data, days=args.days)
+        github = github_census(json.loads(args.github_config.read_text()), days=args.days)
+        report['counts'].update(github['counts'])
+        report['findings'].extend(github['findings'])
+        report['coverage_gaps'].extend(github['coverage_gaps'])
+        report['github_read_failed'] = github['failed']
         args.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n')
         if args.post: post_report(report, os.environ.get('OPS_SERVER_TOKEN'))
         print('Stale sweep finished; report saved; worklog ' + ('recorded' if args.post else 'not requested'))
-        return 0
+        return 1 if github['failed'] else 0
     except Exception as exc:
-        # Public CI logs must not contain internal row names, API bodies or credentials.
         print('Stale sweep failed: ' + type(exc).__name__, file=sys.stderr)
         return 1
 

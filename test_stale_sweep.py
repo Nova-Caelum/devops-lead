@@ -15,28 +15,7 @@ class SweepTests(unittest.TestCase):
         result=sweep.census({'list_work_items':rows},now=NOW)
         self.assertEqual([f['id'] for f in result['findings']],['ready'])
         self.assertEqual(rows[0]['state'],'ready')
-        self.assertTrue(result['coverage_gaps'])
-
-    def test_folder_paths_are_confined_and_absence_is_not_guessed(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder);(root/'exists').mkdir()
-            self.assertEqual(sweep.pointer('exists',root),'exists')
-            self.assertEqual(sweep.pointer('../escape',root),'unverified: outside vault')
-            self.assertEqual(sweep.pointer('/elsewhere',root),'unverified: outside vault')
-            self.assertEqual(sweep.pointer('missing',root),'broken')
-            self.assertEqual(sweep.pointer('exists',None),'unverified: no local vault mounted')
-
-    def test_inventory_repairs_only_generated_file_and_is_idempotent(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder);catalog=root/'AgentSecretBase/catalog';catalog.mkdir(parents=True)
-            index=catalog/'INDEX.md';index.write_text('authored index')
-            (catalog/'outside').symlink_to('/etc/hosts')
-            first=sweep.census({},root,now=NOW,write_inventory=True)
-            second=sweep.census({},root,now=NOW,write_inventory=True)
-            self.assertEqual(index.read_text(),'authored index')
-            self.assertIn('catalog-inventory-regenerated',[f['kind'] for f in first['findings']])
-            self.assertNotIn('catalog-inventory-regenerated',[f['kind'] for f in second['findings']])
-            self.assertEqual(second['counts']['catalog_files'],1)
+        self.assertEqual(result['coverage_gaps'],[])
 
     def test_snapshot_expands_capped_projects_and_reports_remaining_gap(self):
         def rpc(name,args,token):
@@ -56,10 +35,49 @@ class SweepTests(unittest.TestCase):
             self.assertEqual(detail['omitted_findings'],5)
             self.assertEqual(len(detail['findings']),25)
 
-    def test_access_gate_does_not_claim_dashboard_health(self):
-        import urllib.error
-        with patch.object(sweep.urllib.request,'build_opener') as opener:
-            opener.return_value.open.side_effect=urllib.error.HTTPError('https://task.novacaelum.com',302,'gate',{},None)
-            self.assertEqual(sweep.dashboard_probe(),{'http_status':302,'ui_freshness':'unverified'})
+    def test_hosted_never_checks_local_files(self):
+        with patch.object(sweep.Path,'is_dir',side_effect=AssertionError('local access')):
+            result=sweep.census({'list_projects':[{'id':'p','folder_path':'AgentSecretBase/project','status':'paused'}]},now=NOW)
+        self.assertEqual(result['findings'],[])
+        self.assertEqual(result['coverage_gaps'],[])
+
+    def test_github_reports_pr_and_latest_workflow_failure(self):
+        def api(path):
+            if '/actions/runs?' in path:
+                return {'workflow_runs':[
+                    {'workflow_id':1,'id':10,'conclusion':'success','html_url':'ok'},
+                    {'workflow_id':1,'id':9,'conclusion':'failure','html_url':'old'},
+                    {'workflow_id':2,'id':8,'conclusion':'failure','html_url':'bad'}]}
+            return {'default_branch':'main'}
+        prs=[{'number':3,'updatedAt':'2026-09-01T00:00:00Z','isDraft':False,'headRefOid':'abc','statusCheckRollup':[{'name':'build','conclusion':'FAILURE'}]}]
+        with patch.object(sweep,'api',side_effect=api), patch.object(sweep,'gh_json',return_value=prs):
+            result=sweep.github_census({'repositories':[{'repo':'Nova-Caelum/example'}]},now=NOW)
+        self.assertFalse(result['failed'])
+        self.assertEqual([f['kind'] for f in result['findings']],['stale-pr-candidate','pr-ci-failed','default-branch-ci-failed'])
+        self.assertEqual(result['findings'][-1]['run'],8)
+
+    def test_github_failure_is_not_reported_as_empty_success(self):
+        with patch.object(sweep,'api',side_effect=ValueError('SECRET')):
+            result=sweep.github_census({'repositories':[{'repo':'Nova-Caelum/example'}]})
+        self.assertTrue(result['failed'])
+        self.assertNotIn('SECRET',str(result))
+        self.assertIn('ValueError',result['coverage_gaps'][0])
+
+    def test_catalog_pins_resolve_and_changes_only_flag_candidates(self):
+        pin='a'*40
+        manifest={'plugins':[{'name':'base','source':{'source':'git-subdir','url':'https://github.com/Nova-Caelum/example.git','path':'plugins/base','sha':pin}}]}
+        def api(path):
+            if '/compare/' in path:return {'status':'ahead','files':[{'filename':'plugins/base/README.md'}]}
+            return {'default_branch':'main'}
+        with patch.object(sweep,'content',return_value={'name':'base'}) as content,patch.object(sweep,'api',side_effect=api):
+            findings=sweep.catalog_findings('Nova-Caelum/example','main',manifest)
+        self.assertEqual(findings[0]['kind'],'catalog-pin-review-candidate')
+        content.assert_called_once_with('Nova-Caelum/example','plugins/base/.claude-plugin/plugin.json',pin)
+        self.assertEqual(manifest['plugins'][0]['source']['sha'],pin)
+
+    def test_catalog_relative_source_has_no_invented_pin(self):
+        with patch.object(sweep,'content',return_value={'name':'base'}) as content:
+            self.assertEqual(sweep.catalog_findings('Nova-Caelum/example','main',{'plugins':[{'name':'base','source':'./'}]}),[])
+        content.assert_called_once_with('Nova-Caelum/example','.claude-plugin/plugin.json','main')
 
 if __name__=='__main__':unittest.main()

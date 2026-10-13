@@ -1,0 +1,37 @@
+{
+  "repositories": [
+    {
+      "repo": "Nova-Caelum/_agentOS"
+    },
+    {
+      "repo": "Nova-Caelum/devops-lead"
+    },
+    {
+      "repo": "Nova-Caelum/Caelos"
+    },
+    {
+      "repo": "Nova-Caelum/caelos-website"
+    },
+    {
+      "repo": "Nova-Caelum/hyperspace-engine",
+      "catalog": ".claude-plugin/marketplace.json"
+    },
+    {
+      "repo": "Nova-Caelum/no-mistakes",
+      "catalog": ".claude-plugin/marketplace.json"
+    },
+    {
+      "repo": "Nova-Caelum/novacaelum-landing"
+    },
+    {
+      "repo": "Nova-Caelum/palladia"
+    },
+    {
+      "repo": "Nova-Caelum/technical-cofounder",
+      "catalog": ".claude-plugin/marketplace.json"
+    },
+    {
+      "repo": "Nova-Caelum/technical-cofounder-website"
+    }
+  ]
+}
