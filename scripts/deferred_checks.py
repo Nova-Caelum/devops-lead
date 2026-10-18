@@ -148,11 +148,11 @@ def eval_github_workflow_run(gh, check):
 
 
 def count_prs(gh, repos, label, start, end):
-    total = labelled = 0
-    for repo in repos:
-        q = f"repo:{repo} is:pr created:{start}..{end}"
-        total += gh_api(gh, 'search/issues?q=' + q.replace(' ', '+') + '&per_page=1').get('total_count', 0)
-        labelled += gh_api(gh, 'search/issues?q=' + (q + f' label:{label}').replace(' ', '+') + '&per_page=1').get('total_count', 0)
+    """One combined query per window (search API allows 30/min; per-repo queries blew it)."""
+    scope = " ".join("repo:" + r for r in repos)
+    q = f"is:pr created:{start}..{end} {scope}"
+    total = gh_api(gh, "search/issues?q=" + q.replace(" ", "+") + "&per_page=1").get("total_count", 0)
+    labelled = gh_api(gh, "search/issues?q=" + (q + f" label:{label}").replace(" ", "+") + "&per_page=1").get("total_count", 0)
     return total, labelled
 
 
