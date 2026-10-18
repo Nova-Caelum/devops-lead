@@ -10,6 +10,6 @@ One JSON file per Task Graph row whose evidence lands after the work (a schedule
 
 Fields: `row`, `project`, `external_id`, `evaluator` (`cloud`|`mac`), `check` (`github_workflow_run`,
 `escalation_rate_drop`, `local_report`, `catalog_covers_repos`, `composite`), `evidence_path` (must sit under
-`AgentSecretBase/_ops/deferred-checks/evidence/`), `evidence_line` (the row's file_state criterion expects it), `due`, `grace_hours`.
+`AgentSecretBase/_ops/deferred-checks/evidence/`), `evidence_line` (the row's file_state criterion expects it), `touched_extra` (other paths the row's criteria check, passed to the verifier so it can see them), `due`, `grace_hours`.
 The row's criterion must be a `file_state` `contains` of `evidence_line` at `evidence_path`, so the verifier, not this
 registry, decides done. Data only: no code is read from here.
