@@ -50,6 +50,8 @@ jobs:
 
 Pin to a commit SHA, not `@main`, so a change here is reviewed before it reaches you.
 
+**Required permissions on the calling job:** `contents: write`, `pull-requests: write`, `issues: write`, `id-token: write` and `actions: read`. The merge gate reads the Actions API to see whether CI on the commit is green; the reviewer asks the Claude Code Action for `actions: read` on its review token, which can only be granted if the job holds it. A private repo without it cannot be read, and the gate fails closed with a reason that says so. A repo with no CI at all is not an error: the gate reports "no CI configured" and merges.
+
 **Required secret:** `CLAUDE_CODE_OAUTH_TOKEN`.
 
 **Adapting it:** the outcome-logging and notification steps are wired to Nova Caelum's internal services. Anyone else running this should replace or remove those two steps.
