@@ -15,5 +15,11 @@
   "evidence_path": "AgentSecretBase/_ops/deferred-checks/evidence/GOV-385.md",
   "evidence_line": "catalog_inventory=refreshed_by_sweep catalog_covers_active_repos=true missing=0",
   "due": "2026-10-25T13:00:00Z",
-  "grace_hours": 48
+  "grace_hours": 48,
+  "touched_extra": [
+    {
+      "path": "AgentSecretBase/catalog/.stale-sweep-inventory.json",
+      "effect": "created"
+    }
+  ]
 }

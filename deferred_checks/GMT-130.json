@@ -17,5 +17,6 @@
   "evidence_path": "AgentSecretBase/_ops/deferred-checks/evidence/GMT-deferred-check-chain-proof.md",
   "evidence_line": "workflow=Daily stale sweep event=workflow_dispatch conclusion=success sweep_job=success",
   "due": "2026-10-18T20:00:00Z",
-  "grace_hours": 48
+  "grace_hours": 48,
+  "touched_extra": []
 }

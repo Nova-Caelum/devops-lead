@@ -28,5 +28,11 @@
   "evidence_path": "AgentSecretBase/_ops/deferred-checks/evidence/GOV-384.md",
   "evidence_line": "github_sweep=schedule:success flagged_report=posted local_fixer=launchd:clean",
   "due": "2026-10-19T14:00:00Z",
-  "grace_hours": 24
+  "grace_hours": 24,
+  "touched_extra": [
+    {
+      "path": "/Users/danieleghdami/NovaCaelum_code/devops-lead/.github/workflows/daily-stale-sweep.yml",
+      "effect": "created"
+    }
+  ]
 }
