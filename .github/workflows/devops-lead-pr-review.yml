@@ -170,13 +170,31 @@ jobs:
 
           gate_out() { echo "GATE=$1${2:+ - $2}"; }
 
-          # Prints "<n failed>|<n pending>|<n runs>|<failed names>|<pending names>"; returns 1 if CI state is unreadable.
+          # Reads the Actions API once. Success sets CI_ST to "<n failed>|<n pending>|<n runs>|<failed names>|<pending names>".
+          # Failure returns 1 and sets CI_ERR to a FIXED class string - never the API's own text, which can echo credentials.
           # Counts every workflow run on the head commit except this run and any DevOps-Lead review run; if a
           # workflow ran more than once for the same event on this commit, only its newest run counts.
+          # Zero other runs is a valid answer (the repo has no CI), not an error.
+          # GOV-379: the model's shell holds an app token that reads a PRIVATE repo's Actions API only when the review
+          # step requests `actions: read`. Without it every private caller read "unreadable" - so the class is named.
           ci_state() {
-            local resp
-            resp=$(gh api "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" 2>/dev/null) || return 1
-            printf '%s' "$resp" | jq -e -r --argjson self "$SELF_RUN" '
+            local resp errf
+            CI_ST=""; CI_ERR=""
+            errf=$(mktemp) || { CI_ERR="the gate could not create a temp file"; return 1; }
+            if ! resp=$(gh api "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" 2>"$errf"); then
+              if grep -qiE 'rate limit|HTTP 429' "$errf"; then
+                CI_ERR="the Actions API rate-limited the review token"
+              elif grep -qiE 'HTTP 40[134]|not accessible by integration|bad credentials|requires authentication' "$errf"; then
+                CI_ERR="the Actions API denied the review token (the review step needs 'actions: read' on a private repo)"
+              elif grep -qiE 'HTTP 5[0-9][0-9]|timed? ?out|could not resolve|connection (refused|reset)|network|tls' "$errf"; then
+                CI_ERR="the Actions API returned a server or network error"
+              else
+                CI_ERR="the Actions API call failed for an unclassified reason"
+              fi
+              rm -f "$errf"; return 1
+            fi
+            rm -f "$errf"
+            CI_ST=$(printf '%s' "$resp" | jq -e -r --argjson self "$SELF_RUN" '
               def nm: ((.name // "?") | gsub("[^A-Za-z0-9 ._()/+-]"; "") | .[0:60]);
               if (.total_count // 0) > 100 then error("more runs than one page") else . end
               | [ .workflow_runs[]
@@ -190,7 +208,7 @@ jobs:
                   | (nm + "=" + (.conclusion // "?")) ] as $failed
               | [ $runs[] | select(.status != "completed") | (nm + "=" + (.status // "?")) ] as $pending
               | "\($failed | length)|\($pending | length)|\($runs | length)|\($failed | join(", "))|\($pending | join(", "))"
-            ' 2>/dev/null
+            ' 2>/dev/null) || { CI_ST=""; CI_ERR="the Actions API response could not be parsed (malformed, or more than one page of runs)"; return 1; }
           }
 
           # Prints "<state> <headRefOid> <comma-joined labels>"; returns 1 if unreadable.
@@ -215,16 +233,15 @@ jobs:
             [[ "$cur" == "$HEAD_SHA" ]] || { gate_out refused "head moved since this review began (a newer review run handles the new commit)"; return 3; }
             case ",${labels:-}," in *,escalate-daniel,*) gate_out refused "PR is labelled escalate-daniel"; return 3 ;; esac
 
-            local deadline st nfail npend nruns failed pending
+            local deadline nfail npend nruns failed pending
             deadline=$(( $(date +%s) + WAIT_MIN * 60 ))
             while :; do
-              st=""
               for _ in 1 2 3; do
-                st=$(ci_state) && break
-                st=""; sleep $(( POLL_SEC < 5 ? POLL_SEC : 5 ))
+                ci_state && break
+                sleep $(( POLL_SEC < 5 ? POLL_SEC : 5 ))
               done
-              [[ -n "$st" ]] || { gate_out refused "CI state unreadable from the Actions API - failing closed"; return 3; }
-              IFS='|' read -r nfail npend nruns failed pending <<<"$st"
+              [[ -n "$CI_ST" ]] || { gate_out refused "CI state unreadable - ${CI_ERR:-the Actions API could not be read} - failing closed"; return 3; }
+              IFS='|' read -r nfail npend nruns failed pending <<<"$CI_ST"
               (( nfail > 0 )) && { gate_out refused "CI failed: $failed"; return 3; }
               (( npend == 0 )) && break
               (( $(date +%s) >= deadline )) && { gate_out refused "CI still running after ${WAIT_MIN} min: $pending"; return 3; }
@@ -237,7 +254,11 @@ jobs:
             [[ "$state" == "OPEN" && "$cur" == "$HEAD_SHA" ]] || { gate_out refused "PR changed while waiting (state=$state, head moved: $([[ $cur == "$HEAD_SHA" ]] && echo no || echo yes))"; return 3; }
             case ",${labels:-}," in *,escalate-daniel,*) gate_out refused "PR was labelled escalate-daniel while waiting"; return 3 ;; esac
 
-            echo "CI complete and green on ${HEAD_SHA:0:12} (${nruns} other workflow run(s) checked)"
+            if (( nruns == 0 )); then
+              echo "no CI configured on this commit: no other workflow run exists on ${HEAD_SHA:0:12} (the review is the only one) - nothing to wait for"
+            else
+              echo "CI complete and green on ${HEAD_SHA:0:12} (${nruns} other workflow run(s) checked)"
+            fi
             local out rc
             out=$(gh pr merge "$PR" --repo "$REPO" --auto --squash --match-head-commit "$HEAD_SHA" 2>&1); rc=$?
             if (( rc != 0 )); then
@@ -280,6 +301,13 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           show_full_output: true
+          # GOV-379 (2026-10-18): the action overwrites GH_TOKEN in the model's shell with an app token minted by an
+          # OIDC exchange that grants only contents/pull_requests/issues write. Without this input the merge gate's
+          # `GET /actions/runs` is denied on a PRIVATE repo (a public repo's runs are world-readable), so every private
+          # caller failed closed with "CI state unreadable". The job's `permissions: actions: read` (caller stub) is the
+          # ceiling this request needs; the Claude app installation already holds actions on all repositories.
+          additional_permissions: |
+            actions: read
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
