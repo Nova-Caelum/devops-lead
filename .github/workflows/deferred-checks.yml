@@ -1,0 +1,58 @@
+name: Deferred checks
+on:
+  schedule:
+    # Every 3 hours at :47, so the 11:17 UTC stale sweep is judged by 12:47 UTC.
+    - cron: '47 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Evaluate one registered row (short ID), blank for all'
+        required: false
+        default: ''
+      simulate_stale_heartbeat:
+        description: 'Raise the heartbeat alarm once (safety-net test)'
+        type: boolean
+        default: false
+  pull_request:
+    paths: ['scripts/deferred_checks.py', 'deferred_checks/**', 'test_deferred_checks.py', '.github/workflows/deferred-checks.yml']
+  push:
+    branches: [main]
+    paths: ['scripts/deferred_checks.py', 'deferred_checks/**', 'test_deferred_checks.py', '.github/workflows/deferred-checks.yml']
+permissions:
+  contents: read
+concurrency:
+  group: deferred-checks-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest test_deferred_checks.py
+  check:
+    needs: test
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.DEFERRED_CHECKS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - name: Evaluate deferred checks and cross-watch the Mac closer
+        env:
+          GH_TOKEN: ${{ secrets.STALE_SWEEP_GITHUB_TOKEN }}
+          STALE_SWEEP_READ_TOKEN: ${{ secrets.STALE_SWEEP_READ_TOKEN }}
+          OPS_SERVER_TOKEN: ${{ secrets.OPS_SERVER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_DANIEL_CHAT_ID: ${{ secrets.TELEGRAM_DANIEL_CHAT_ID }}
+          ONLY: ${{ inputs.only }}
+          SIMULATE: ${{ inputs.simulate_stale_heartbeat }}
+        # Public repository: the script prints counts and failure classes only.
+        run: |
+          args=()
+          [ -n "${ONLY:-}" ] && args+=(--only "$ONLY")
+          [ "${SIMULATE:-false}" = "true" ] && args+=(--simulate-stale-heartbeat)
+          python3 scripts/deferred_checks.py "${args[@]}"

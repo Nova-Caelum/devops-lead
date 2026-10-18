@@ -1,0 +1,19 @@
+{
+  "row": "GOV-385",
+  "project": "governance-evolution",
+  "external_id": "governance-evolution:stale-sweep-catalog-currency",
+  "evaluator": "mac",
+  "note": "Scripted form of \"every active GitHub repo appears in the catalog\". 16 of 20 active repos were missing on 2026-10-18; scope is Daniel's call (exclude list or catalog update).",
+  "check": {
+    "type": "catalog_covers_repos",
+    "org": "Nova-Caelum",
+    "index": "AgentSecretBase/catalog/INDEX.md",
+    "inventory": "AgentSecretBase/catalog/.stale-sweep-inventory.json",
+    "inventory_after": "2026-10-12T21:31:00Z",
+    "exclude": []
+  },
+  "evidence_path": "AgentSecretBase/_ops/deferred-checks/evidence/GOV-385.md",
+  "evidence_line": "catalog_inventory=refreshed_by_sweep catalog_covers_active_repos=true missing=0",
+  "due": "2026-10-25T13:00:00Z",
+  "grace_hours": 48
+}
