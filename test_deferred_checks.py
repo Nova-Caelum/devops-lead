@@ -144,7 +144,7 @@ class Tests(unittest.TestCase):
         chk = {'type': 'escalation_rate_drop', 'repos': ['o/r'], 'label': 'escalate-daniel',
                'baseline': ['2026-10-07', '2026-10-13'], 'after': ['2026-10-15', '2026-10-21']}
         def q(s, e, lab=False):
-            base = f'search/issues?q=repo:o/r+is:pr+created:{s}..{e}'
+            base = f'search/issues?q=is:pr+created:{s}..{e}+repo:o/r'
             return base + ('+label:escalate-daniel' if lab else '') + '&per_page=1'
         gh = FakeGh(search={q('2026-10-07', '2026-10-13'): 10, q('2026-10-07', '2026-10-13', True): 8,
                             q('2026-10-15', '2026-10-21'): 10, q('2026-10-15', '2026-10-21', True): 3})
