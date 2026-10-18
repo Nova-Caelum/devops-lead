@@ -1,0 +1,21 @@
+{
+  "row": "GMT-130",
+  "project": "graph-machine-testbed",
+  "external_id": "graph-machine-testbed:deferred-check-chain-proof",
+  "evaluator": "cloud",
+  "note": "Plan B chain proof on a testbed row; archive after.",
+  "check": {
+    "type": "github_workflow_run",
+    "repo": "Nova-Caelum/devops-lead",
+    "workflow": "daily-stale-sweep.yml",
+    "event": "workflow_dispatch",
+    "conclusion": "success",
+    "job": "sweep",
+    "created_after": "2026-10-18T19:00:00Z",
+    "report_tag": "daily-stale-sweep"
+  },
+  "evidence_path": "AgentSecretBase/_ops/deferred-checks/evidence/GMT-deferred-check-chain-proof.md",
+  "evidence_line": "workflow=Daily stale sweep event=workflow_dispatch conclusion=success sweep_job=success",
+  "due": "2026-10-18T20:00:00Z",
+  "grace_hours": 48
+}

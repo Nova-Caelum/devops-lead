@@ -1,0 +1,21 @@
+{
+  "row": "GOV-377",
+  "project": "governance-evolution",
+  "external_id": "governance-evolution:daily-stale-sweep",
+  "evaluator": "cloud",
+  "note": "First scheduled stale sweep after enablement (2026-10-18) with the sweep job executed and its report posted.",
+  "check": {
+    "type": "github_workflow_run",
+    "repo": "Nova-Caelum/devops-lead",
+    "workflow": "daily-stale-sweep.yml",
+    "event": "schedule",
+    "conclusion": "success",
+    "job": "sweep",
+    "created_after": "2026-10-18T19:40:00Z",
+    "report_tag": "daily-stale-sweep"
+  },
+  "evidence_path": "AgentSecretBase/_ops/deferred-checks/evidence/GOV-377.md",
+  "evidence_line": "workflow=Daily stale sweep event=schedule conclusion=success sweep_job=success report_posted=true",
+  "due": "2026-10-19T13:00:00Z",
+  "grace_hours": 24
+}

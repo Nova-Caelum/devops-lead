@@ -1,0 +1,34 @@
+{
+  "row": "GOV-379",
+  "project": "governance-evolution",
+  "external_id": "governance-evolution:devops-lead-review-all-active-repos",
+  "evaluator": "cloud",
+  "note": "Escalation share (escalate-daniel PRs / PRs) in the week after the policy alignment vs the week before.",
+  "check": {
+    "type": "escalation_rate_drop",
+    "repos": [
+      "Nova-Caelum/_agentOS",
+      "Nova-Caelum/Caelos",
+      "Nova-Caelum/caelos-website",
+      "Nova-Caelum/hyperspace-engine",
+      "Nova-Caelum/no-mistakes",
+      "Nova-Caelum/novacaelum-landing",
+      "Nova-Caelum/palladia",
+      "Nova-Caelum/technical-cofounder",
+      "Nova-Caelum/technical-cofounder-website"
+    ],
+    "label": "escalate-daniel",
+    "baseline": [
+      "2026-10-07",
+      "2026-10-13"
+    ],
+    "after": [
+      "2026-10-15",
+      "2026-10-21"
+    ]
+  },
+  "evidence_path": "AgentSecretBase/_ops/deferred-checks/evidence/GOV-379.md",
+  "evidence_line": "escalation_rate_dropped=true",
+  "due": "2026-10-22T13:00:00Z",
+  "grace_hours": 24
+}

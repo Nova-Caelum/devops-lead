@@ -1,0 +1,32 @@
+{
+  "row": "GOV-384",
+  "project": "governance-evolution",
+  "external_id": "governance-evolution:stale-sweep-cron",
+  "evaluator": "mac",
+  "note": "Split ruling 2026-10-13: the GitHub cron flags, the local launchd job fixes (catalog inventory, dashboard). Both must run on schedule.",
+  "check": {
+    "type": "composite",
+    "parts": [
+      {
+        "type": "github_workflow_run",
+        "repo": "Nova-Caelum/devops-lead",
+        "workflow": "daily-stale-sweep.yml",
+        "event": "schedule",
+        "conclusion": "success",
+        "job": "sweep",
+        "created_after": "2026-10-18T19:40:00Z",
+        "report_tag": "daily-stale-sweep"
+      },
+      {
+        "type": "local_report",
+        "path": "AgentSecretBase/_meta/LOCAL_STALE_SWEEP_REPORT.json",
+        "trigger": "launchd",
+        "observed_after": "2026-10-18T20:00:00Z"
+      }
+    ]
+  },
+  "evidence_path": "AgentSecretBase/_ops/deferred-checks/evidence/GOV-384.md",
+  "evidence_line": "github_sweep=schedule:success flagged_report=posted local_fixer=launchd:clean",
+  "due": "2026-10-19T14:00:00Z",
+  "grace_hours": 24
+}
