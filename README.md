@@ -59,8 +59,13 @@ Pin to a commit SHA, not `@main`, so a change here is reviewed before it reaches
 | Path | What it is |
 |---|---|
 | `.github/workflows/devops-lead-pr-review.yml` | The reusable review workflow |
+| `.github/workflows/escalation-override-report.yml` | Scheduled report of PRs merged over an escalation, with `scripts/escalation_override_report.py` |
 | `.claude/agents/devops-lead.md` | The reviewer's persona. It is maintained in a private source and synced here, so edit it at the source rather than in this repo. |
 | `.claude/settings.json` | Opens this repo in Claude Code with the `devops-lead` agent as the main thread |
+
+## Reporting overrides
+
+The escalation label is soft: a PR can be merged over it. `.github/workflows/escalation-override-report.yml` runs from this repository, finds every PR merged while it carried the label, and sends one Telegram message per PR with the objection, who merged it, and the merger's stated reason. Details: [docs/escalation-override-report.md](docs/escalation-override-report.md).
 
 ## Status
 
