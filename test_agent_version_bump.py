@@ -95,6 +95,7 @@ def plan_for(changes, before=None, after=None):
 def run(changes, rpc=None, before=None, after=None, **kw):
     rpc = rpc or RecordingRpc()
     buf = io.StringIO()
+    kw.setdefault('notify', Notifier())
     with redirect_stdout(buf):
         code = avb.run(FakeRepo(changes, before, after), BEFORE, AFTER, rpc, **kw)
     return code, buf.getvalue(), rpc
@@ -315,6 +316,72 @@ class RunTests(unittest.TestCase):
             code = avb.run(FakeRepo(['core_text/daniel.md']), '0' * 40, AFTER, RecordingRpc())
         self.assertEqual(code, 1)
         self.assertIn('null SHA', buf.getvalue())
+
+
+class WorkflowCommandTests(unittest.TestCase):
+    def test_escaping_follows_the_workflow_command_rules(self):
+        self.assertEqual(avb.cmd_data('a%b\r\nc'), 'a%25b%0D%0Ac')
+        self.assertEqual(avb.cmd_prop('a:b,c%\n'), 'a%3Ab%2Cc%25%0A')
+
+    def test_a_newline_bearing_path_cannot_open_a_workflow_command(self):
+        evil = 'brand_new_dir/x\n::error::pwned\r\n::add-mask::y'
+        code, out, _ = run([evil])
+        self.assertEqual(code, 0)
+        for line in out.splitlines():
+            self.assertFalse(line.startswith('::error') or line.startswith('::add-mask'), line)
+        warning = [l for l in out.splitlines() if l.startswith('::warning')]
+        self.assertEqual(len(warning), 1)
+        self.assertIn('%0A::error::pwned', warning[0])
+
+
+class Notifier:
+    def __init__(self, fail=False):
+        self.sent, self.fail = [], fail
+
+    def __call__(self, text):
+        if self.fail:
+            raise avb.TelegramError('transport')
+        self.sent.append(text)
+
+
+class UnmappedAlertTests(unittest.TestCase):
+    def test_unmapped_paths_send_one_telegram_with_commit_ten_paths_and_count(self):
+        paths = [f'brand_new_dir/f{i:02d}.md' for i in range(12)]
+        notify = Notifier()
+        code, out, _ = run(paths, notify=notify)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(notify.sent), 1)
+        msg = notify.sent[0]
+        self.assertIn(AFTER[:12], msg.splitlines()[0])
+        listed = [l for l in msg.splitlines() if l.startswith('- ')]
+        self.assertEqual(listed, [f'- {p}' for p in paths[:10]])
+        self.assertIn('12 UNMAPPED', msg.splitlines()[-1])
+        self.assertIn('::warning', out)
+
+    def test_no_unmapped_path_sends_nothing(self):
+        notify = Notifier()
+        run(['core_text/daniel.md', 'README.md'], notify=notify)
+        self.assertEqual(notify.sent, [])
+
+    def test_alert_is_independent_of_the_write(self):
+        notify = Notifier()
+        code, _, rpc = run(['core_text/daniel.md', 'brand_new_dir/x.md'], notify=notify)
+        self.assertEqual((code, len(rpc.writes()), len(notify.sent)), (0, 1, 1))
+
+    def test_a_failed_alert_fails_the_run_but_the_write_still_lands(self):
+        code, out, rpc = run(['core_text/daniel.md', 'brand_new_dir/x.md'], notify=Notifier(fail=True))
+        self.assertEqual((code, len(rpc.writes())), (1, 1))
+        self.assertIn('UNMAPPED ALERT FAILED', out)
+
+    def test_a_live_run_without_telegram_secrets_fails_when_paths_are_unmapped(self):
+        code, out, _ = run(['brand_new_dir/x.md'], notify=None)
+        self.assertEqual(code, 1)
+        self.assertIn('UNMAPPED ALERT FAILED', out)
+
+    def test_a_dry_run_without_telegram_secrets_says_so_and_does_not_fail(self):
+        code, out, _ = run(['brand_new_dir/x.md'], notify=None, dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertIn('UNMAPPED alert not sent', out)
 
 
 if __name__ == '__main__':

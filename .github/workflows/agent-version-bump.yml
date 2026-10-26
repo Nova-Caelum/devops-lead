@@ -10,8 +10,9 @@ name: Agent version bump
 # mapping is read live from agent_registry; nothing here names an agent. See scripts/agent_version_bump.py.
 #
 # Execution context: under workflow_call everything resolves against the CALLER (_agentOS, private):
-# secrets via `secrets: inherit`, github.token, and the logs. A workflow_dispatch here runs in this PUBLIC
-# repository, so it is always a dry run and prints counts only.
+# github.token and the logs. The caller passes only the secrets declared below, by name. A
+# workflow_dispatch here runs in this PUBLIC repository, so it is always a dry run and prints counts only.
+# UNMAPPED paths warn AND go to Daniel's Telegram (one message per run).
 #
 # Runs are serialized (one concurrency group, queue: max) so no push's bump is dropped as a superseded
 # pending run.
@@ -29,7 +30,16 @@ on:
         required: true
     secrets:
       OPS_SERVER_TOKEN:
+        description: 'Ops MCP bearer (devops-lead-actions-aaasops): registry read + bump_agent_versions'
         required: true
+      TELEGRAM_BOT_TOKEN:
+        description: 'DevOps-Lead bot: failure and UNMAPPED alerts'
+        required: true
+      TELEGRAM_DANIEL_CHAT_ID:
+        required: true
+      STALE_SWEEP_GITHUB_TOKEN:
+        description: 'workflow_dispatch only (reads private _agentOS from this repo); callers do not pass it'
+        required: false
   workflow_dispatch:
     inputs:
       before:
@@ -92,13 +102,15 @@ jobs:
           ref: ${{ inputs.after }}
           fetch-depth: 0
           path: .agentos
-          # Under workflow_call the caller's github.token reads its own repo (STALE_SWEEP_GITHUB_TOKEN does not
-          # exist on _agentOS). Under workflow_dispatch here, the fine-grained token with Contents read does.
+          # Under workflow_call the caller's github.token reads its own repo (the caller does not pass
+          # STALE_SWEEP_GITHUB_TOKEN). Under workflow_dispatch here, the fine-grained token with Contents read does.
           token: ${{ secrets.STALE_SWEEP_GITHUB_TOKEN || github.token }}
           persist-credentials: false
       - name: Bump agent versions
         env:
           OPS_SERVER_TOKEN: ${{ secrets.OPS_SERVER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_DANIEL_CHAT_ID: ${{ secrets.TELEGRAM_DANIEL_CHAT_ID }}
           BEFORE: ${{ inputs.before }}
           AFTER: ${{ inputs.after }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' }}

@@ -18,7 +18,8 @@ The path -> agent mapping is read live from agent_registry (raw rows, include_co
   CORE_PREFIXES / CORE_PATHS              -> the core group
 The core group is every non-Retired row whose harness equals core_claude's. Retired agents never bump.
 IGNORE_* paths never reach an agent's runtime. Anything neither mapped nor ignored is UNMAPPED: it is
-printed and raises a ::warning:: — never dropped silently.
+printed, raises a ::warning:: and goes to Daniel's Telegram in one message per run — never dropped silently.
+Paths are escaped wherever they reach a log line, so a path can never open a workflow command.
 
 Exit codes: 0 done (UNMAPPED paths warn, they do not fail) · 1 a git, registry or write failure, or a
 write the verb answered with refused/moved agents · 2 usage or a missing secret. Output is fixed strings plus our own paths and agent names; it never echoes
@@ -36,11 +37,14 @@ import sys
 import urllib.error
 import urllib.request
 
+from deferred_checks import TelegramError, send_telegram  # the existing DevOps-Lead Telegram path
+
 OPS = 'https://nova-caelum-ops-production.up.railway.app/mcp'
 WRITE_VERB = 'bump_agent_versions'
 CORE_ROW = 'core_claude'
 RETIRED = 'Retired'
 NULL_SHA = '0' * 40
+UNMAPPED_ALERT_PATHS = 10
 SHA = re.compile(r'^[0-9a-f]{40}$')
 
 MCP_CONFIG = 'system/vault-scope/vault-mcp.json'
@@ -308,23 +312,55 @@ def make_rpc(token, url=OPS):
 
 
 # ── the run ──────────────────────────────────────────────────────────────────
+def cmd_data(text):
+    """Escape a workflow-command message (and any line a path reaches): a path can never start a new `::` line."""
+    return text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+
+def cmd_prop(text):
+    return cmd_data(text).replace(':', '%3A').replace(',', '%2C')
+
+
 def report(plan, before, after, n_paths, counts_only, out):
     if counts_only:
         out(f'agent-version-bump: paths={n_paths} agents={len(plan.bumps)} causing_paths={len(plan.causing_paths())} '
             f'ignored={len(plan.ignored)} no_agent={len(plan.no_agent)} unmapped={len(plan.unmapped)}')
         if plan.unmapped:
-            out(f'::warning title=agent-version-bump::{len(plan.unmapped)} UNMAPPED path(s); '
+            out(f'::warning title={cmd_prop("agent-version-bump")}::{len(plan.unmapped)} UNMAPPED path(s); '
                 'rerun locally or read the caller run for names')
         return
     out(f'agent-version-bump _agentOS {before[:12]}..{after[:12]}: {n_paths} changed path(s)')
     for agent, paths in sorted(plan.bumps.items()):
-        out(f'BUMP {agent} <- ' + ', '.join(paths))
+        out(f'BUMP {agent} <- ' + cmd_data(', '.join(paths)))
     for path, why in plan.no_agent:
-        out(f'NO-AGENT {path} ({why})')
+        out(cmd_data(f'NO-AGENT {path} ({why})'))
     for path, why in plan.unmapped:
-        out(f'UNMAPPED {path} ({why})')
-        out(f'::warning title=agent-version-bump UNMAPPED::{path}: {why}')
-    out(f'IGNORED {len(plan.ignored)} path(s)' + (': ' + ', '.join(plan.ignored) if plan.ignored else ''))
+        out(cmd_data(f'UNMAPPED {path} ({why})'))
+        out(f'::warning title={cmd_prop("agent-version-bump UNMAPPED")}::{cmd_data(f"{path}: {why}")}')
+    out(f'IGNORED {len(plan.ignored)} path(s)' + (': ' + cmd_data(', '.join(plan.ignored)) if plan.ignored else ''))
+
+
+def alert_unmapped(plan, after, notify, dry_run, out):
+    """Build Gospel rule 1: an UNMAPPED path reaches Daniel, not only a ::warning:: on a green run."""
+    if not plan.unmapped:
+        return 0
+    if notify is None:
+        if dry_run:
+            out('UNMAPPED alert not sent: dry run without Telegram secrets')
+            return 0
+        out('UNMAPPED ALERT FAILED: missing Telegram secret(s)')
+        return 1
+    lines = [f'Agent version bump: UNMAPPED path(s) in _agentOS {after[:12]}']
+    lines += [f'- {path}' for path, _ in plan.unmapped[:UNMAPPED_ALERT_PATHS]]
+    lines.append(f'{len(plan.unmapped)} UNMAPPED path(s) in total. No rule maps them, so they bumped nobody; '
+                 'the run summary has the reasons.')
+    try:
+        notify('\n'.join(lines))
+    except TelegramError as e:
+        out(f'UNMAPPED ALERT FAILED: telegram {e}')
+        return 1
+    out('UNMAPPED alert sent')
+    return 0
 
 
 def write_summary(plan, args_payload, outcome):
@@ -344,7 +380,7 @@ def write_summary(plan, args_payload, outcome):
         fh.write('\n'.join(lines) + '\n')
 
 
-def run(repo, before, after, rpc, *, dry_run=False, counts_only=False, out=print):
+def run(repo, before, after, rpc, *, dry_run=False, counts_only=False, notify=None, out=print):
     if before == NULL_SHA:
         out('ERROR: before is the null SHA (a branch creation or a ref with no prior commit); refusing to guess the range')
         return 1
@@ -369,6 +405,11 @@ def run(repo, before, after, rpc, *, dry_run=False, counts_only=False, out=print
         return 1
     plan = build_plan(repo, before, after, registry)
     report(plan, before, after, len(paths), counts_only, out)
+    alerted = alert_unmapped(plan, after, notify, dry_run, out)
+    return max(alerted, write(plan, after, rpc, dry_run, counts_only, out))
+
+
+def write(plan, after, rpc, dry_run, counts_only, out):
     if not plan.bumps:
         out('agent-version-bump: nothing to bump')
         write_summary(plan, None, 'nothing to bump')
@@ -415,16 +456,20 @@ def run(repo, before, after, rpc, *, dry_run=False, counts_only=False, out=print
     return 0
 
 
-def notify_failure(after, run_url):
-    from deferred_checks import TelegramError, send_telegram  # the existing DevOps-Lead alert path
+def telegram():
     token, chat = os.environ.get('TELEGRAM_BOT_TOKEN'), os.environ.get('TELEGRAM_DANIEL_CHAT_ID')
-    if not (token and chat):
+    return (lambda text: send_telegram(token, chat, text)) if token and chat else None
+
+
+def notify_failure(after, run_url):
+    notify = telegram()
+    if notify is None:
         print('ERROR: missing Telegram secret(s)')
         return 2
     text = (f'Agent version bump FAILED for _agentOS {(after or "?")[:12]}. Agents whose config changed may not '
             f'have rotated their gateway key. Run: {run_url or "(unknown)"}')
     try:
-        send_telegram(token, chat, text)
+        notify(text)
     except TelegramError as e:
         print(f'ERROR: telegram {e}')
         return 1
@@ -451,7 +496,7 @@ def main(argv=None):
         print('ERROR: missing OPS_SERVER_TOKEN')
         return 2
     return run(GitRepo(args.repo), args.before, args.after, make_rpc(token),
-               dry_run=args.dry_run, counts_only=args.counts_only)
+               dry_run=args.dry_run, counts_only=args.counts_only, notify=telegram())
 
 
 if __name__ == '__main__':
