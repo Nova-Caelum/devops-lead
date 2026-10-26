@@ -10,7 +10,8 @@ name: Agent version bump
 # mapping is read live from agent_registry; nothing here names an agent. See scripts/agent_version_bump.py.
 #
 # Execution context: under workflow_call everything resolves against the CALLER (_agentOS, private):
-# github.token and the logs. The caller passes only the secrets declared below, by name. A
+# github.token and the logs. The caller passes only the secrets declared below, by name; the registry read
+# and the write both use the bump-only key AGENT_VERSION_BUMP_TOKEN (never the PR-review key). A
 # workflow_dispatch here runs in this PUBLIC repository, so it is always a dry run and prints counts only.
 # UNMAPPED paths warn AND go to Daniel's Telegram (one message per run).
 #
@@ -29,8 +30,8 @@ on:
         type: string
         required: true
     secrets:
-      OPS_SERVER_TOKEN:
-        description: 'Ops MCP bearer (devops-lead-actions-aaasops): registry read + bump_agent_versions'
+      AGENT_VERSION_BUMP_TOKEN:
+        description: 'Bump-only ops key (agent-version-bump-actions): list_agents, get_agent_info, bump_agent_versions'
         required: true
       TELEGRAM_BOT_TOKEN:
         description: 'DevOps-Lead bot: failure and UNMAPPED alerts'
@@ -108,7 +109,7 @@ jobs:
           persist-credentials: false
       - name: Bump agent versions
         env:
-          OPS_SERVER_TOKEN: ${{ secrets.OPS_SERVER_TOKEN }}
+          AGENT_VERSION_BUMP_TOKEN: ${{ secrets.AGENT_VERSION_BUMP_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_DANIEL_CHAT_ID: ${{ secrets.TELEGRAM_DANIEL_CHAT_ID }}
           BEFORE: ${{ inputs.before }}

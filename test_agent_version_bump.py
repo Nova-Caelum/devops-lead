@@ -1,7 +1,9 @@
 import io
 import json
+import os
 import sys
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -382,6 +384,22 @@ class UnmappedAlertTests(unittest.TestCase):
         code, out, _ = run(['brand_new_dir/x.md'], notify=None, dry_run=True)
         self.assertEqual(code, 0)
         self.assertIn('UNMAPPED alert not sent', out)
+
+
+class MainTests(unittest.TestCase):
+    def test_only_the_bump_key_secret_is_accepted(self):
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {'OPS_SERVER_TOKEN': 'old-pr-review-key'}, clear=True), redirect_stdout(buf):
+            code = avb.main(['--before', BEFORE, '--after', AFTER, '--dry-run'])
+        self.assertEqual(code, 2)
+        self.assertIn('missing AGENT_VERSION_BUMP_TOKEN', buf.getvalue())
+
+    def test_the_bump_key_is_what_reaches_the_ops_transport(self):
+        with mock.patch.dict(os.environ, {'AGENT_VERSION_BUMP_TOKEN': 'bump-key'}, clear=True), \
+                mock.patch.object(avb, 'make_rpc') as make_rpc, mock.patch.object(avb, 'run', return_value=0) as run_:
+            self.assertEqual(avb.main(['--before', BEFORE, '--after', AFTER]), 0)
+        make_rpc.assert_called_once_with('bump-key')
+        self.assertIs(run_.call_args.args[3], make_rpc.return_value)
 
 
 if __name__ == '__main__':

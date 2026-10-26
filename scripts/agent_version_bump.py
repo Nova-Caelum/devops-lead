@@ -6,6 +6,9 @@ Each bump rotates that agent's Caelos Gaetway key (HMAC over `gaetway-agent-key:
 A missed bump is a missed rotation; a double bump on a re-run would refuse live sessions, so the single
 write per push carries the idempotency key `agent-version-bump:<after-sha>`.
 
+Both the registry read and the write use the bump-only ops key AGENT_VERSION_BUMP_TOKEN (client
+`agent-version-bump-actions`: list_agents, get_agent_info, bump_agent_versions).
+
 The path -> agent mapping is read live from agent_registry (raw rows, include_core=false, plus the
 `core_claude` row). Nothing here names an agent:
   agent_profiles/<dir>/<file>.md          -> the agent in the file's frontmatter `name:`
@@ -491,9 +494,9 @@ def main(argv=None):
         return notify_failure(args.after, args.run_url)
     if not (args.before and args.after):
         ap.error('--before and --after are required')
-    token = os.environ.get('OPS_SERVER_TOKEN')
+    token = os.environ.get('AGENT_VERSION_BUMP_TOKEN')  # the bump-only ops key; the PR-review key is refused by the verb
     if not token:
-        print('ERROR: missing OPS_SERVER_TOKEN')
+        print('ERROR: missing AGENT_VERSION_BUMP_TOKEN')
         return 2
     return run(GitRepo(args.repo), args.before, args.after, make_rpc(token),
                dry_run=args.dry_run, counts_only=args.counts_only, notify=telegram())
