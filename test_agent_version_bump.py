@@ -193,6 +193,13 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(sorted(plan.ignored), sorted(paths))
         self.assertEqual(plan.unmapped, [])
 
+    def test_jonin_own_files_are_ignored_not_unmapped(self):
+        paths = ['system/olympus1-scope/jonin/bin/jonin_install.py', 'system/olympus1-scope/jonin/bin/jonin_deploy_env.sh',
+                 'system/olympus1-scope/jonin/systemd/jonin-deploy.timer', 'system/olympus1-scope/jonin/jobs/guard-check.toml']
+        plan = plan_for(paths)
+        self.assertEqual((plan.bumps, plan.unmapped), ({}, []))
+        self.assertEqual(sorted(plan.ignored), sorted(paths))
+
     def test_unknown_path_is_unmapped(self):
         plan = plan_for(['brand_new_dir/thing.md', 'skills_library/loose-file.md'])
         self.assertEqual(plan.bumps, {})

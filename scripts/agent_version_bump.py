@@ -61,6 +61,7 @@ IGNORE_PREFIXES = (
     'graph_library/',                  # Graph Machine and MCP server implementation, not agent configuration
     'hooks_library/ledgers/',          # runtime state; the deployer never overwrites it
     'system/github-actions_library/', 'system/tests_library/',
+    'system/olympus1-scope/jonin/',    # Jonin deploys through its own installer; its files map to no agent
 )
 IGNORE_PATHS = {
     '.gitattributes', '.gitignore', '.gitleaksignore',
