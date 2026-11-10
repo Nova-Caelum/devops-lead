@@ -1,0 +1,193 @@
+name: Baseline CI
+
+# Shared baseline check for every repository created by the gateway's work.kickoff.
+#
+# Callers invoke it from a job whose id is `baseline`, so the org ruleset "baseline-ci required"
+# (repos with custom property nc-bootstrap=true) requires the status check `baseline / checks`.
+# The caller grants `contents: write` and `pull-requests: write` and triggers on pull_request
+# (types opened, synchronize, reopened, ready_for_review).
+#
+# Runs on the org's self-hosted olympus1 runner (default runner group: private repositories only).
+# No third-party action: plain git, and gitleaks / gh / ruff pinned by version and sha256 (each
+# checked against the release's checksums file and the GitHub asset digest). The one action used,
+# actions/setup-node, is GitHub-owned and SHA-pinned, and runs only when a lint script exists.
+
+on:
+  workflow_call:
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  GH_VERSION: 2.103.3
+  GH_SHA256: 4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+  RUFF_VERSION: 0.17.4
+  RUFF_SHA256: 3ab2b34aeacdbc1ea5c529cdbda3e05792633d587228123fd09f3b5a0facb27a
+
+jobs:
+  checks:
+    runs-on: [self-hosted, olympus1]
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: baseline-ci-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        shell: bash
+    # GITHUB_TOKEN is given only to the two steps that need it, never to steps that run repo code.
+    env:
+      EVENT: ${{ github.event_name }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_NAME: ${{ github.event.pull_request.base.ref }}
+      IS_DRAFT: ${{ github.event.pull_request.draft }}
+    steps:
+      # No actions/checkout: plain git with a one-command auth header, nothing persisted in the repo config.
+      # The header goes through git's environment, not its argv: olympus1 is a shared host, and argv is
+      # readable by every local user while /proc/<pid>/environ is not.
+      - name: Fetch base and the PR head into a clean workspace
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT" = pull_request ] || { echo "::error::baseline-ci checks pull requests; this run's event is $EVENT"; exit 1; }
+          cd "$GITHUB_WORKSPACE"
+          find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +   # a self-hosted workspace persists between jobs
+          git init -q .
+          git remote add origin "https://github.com/${REPO}.git"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="$auth" git fetch -q --no-tags origin \
+            "+refs/heads/${BASE_NAME}:refs/remotes/origin/${BASE_NAME}" "+refs/pull/${PR}/head:refs/remotes/pr/head"
+          unset auth
+          test "$(git rev-parse refs/remotes/pr/head)" = "$HEAD_SHA" || { echo "::error::PR head moved since the event (a newer run will follow)"; exit 1; }
+          git -c advice.detachedHead=false checkout -q "$HEAD_SHA"
+
+      - name: Install pinned gitleaks and gh (sha256-verified)
+        run: |
+          set -euo pipefail
+          get() { curl -fsSL -o "$3" "$1" && echo "$2  $3" | sha256sum -c --quiet -; }
+          mkdir -p "$RUNNER_TEMP/bin"
+          get "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            "$GITLEAKS_SHA256" "$RUNNER_TEMP/gitleaks.tgz"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP/bin" gitleaks
+          get "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+            "$GH_SHA256" "$RUNNER_TEMP/gh.tgz"
+          tar -xzf "$RUNNER_TEMP/gh.tgz" -C "$RUNNER_TEMP/bin" --strip-components=2 "gh_${GH_VERSION}_linux_amd64/bin/gh"
+          echo "gitleaks $("$RUNNER_TEMP/bin/gitleaks" version), $("$RUNNER_TEMP/bin/gh" --version | head -1)"
+
+      # Scans the PR's commits. The repo's own .gitleaks.toml / .gitleaksignore are read from the base
+      # branch, so a PR cannot weaken them; with no repo config, gitleaks' built-in default rules apply.
+      - name: Secrets
+        run: |
+          set -euo pipefail
+          base="origin/${BASE_NAME}"
+          cfg="$RUNNER_TEMP/gitleaks.toml"; ign="$RUNNER_TEMP/gitleaksignore"; report="$RUNNER_TEMP/gitleaks.json"
+          if git cat-file -e "$base:.gitleaks.toml" 2>/dev/null; then
+            git show "$base:.gitleaks.toml" > "$cfg"; echo "config: the repo's .gitleaks.toml on ${BASE_NAME}"
+          else
+            printf '[extend]\nuseDefault = true\n' > "$cfg"; echo "config: gitleaks default rules"
+          fi
+          git show "$base:.gitleaksignore" > "$ign" 2>/dev/null || : > "$ign"
+          set +e   # exit 2 = findings, so a scanner crash (exit 1) is told apart from a finding
+          "$RUNNER_TEMP/bin/gitleaks" git --log-opts="$base..$HEAD_SHA" --config "$cfg" --gitleaks-ignore-path "$ign" \
+            --redact --no-banner --exit-code 2 --report-format json --report-path "$report" > "$RUNNER_TEMP/gitleaks.out" 2>&1
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "Secrets: clean (gitleaks ${GITLEAKS_VERSION})" ;;
+            2) echo "::error::gitleaks found possible secrets; remove the value and push again (file:line and rule only, matched text never shown):"
+               python3 -c 'import json,sys; [print("  %s:%s rule %s" % (f["File"], f["StartLine"], f["RuleID"])) for f in json.load(open(sys.argv[1]))]' "$report"
+               exit 1 ;;
+            *) echo "::error::gitleaks failed (exit $rc): scanner error, not a finding"
+               tail -20 "$RUNNER_TEMP/gitleaks.out" | sed -E 's/(Secret|Match).*/\1: [omitted]/'
+               exit 1 ;;
+          esac
+
+      # The committed loadout must reach every clone: tracked, not ignored, no machine-absolute path,
+      # and .aelpha/EGO.md a symlink to AGENTS.md.
+      - name: Loadout hygiene
+        run: |
+          set -euo pipefail
+          fail=0
+          bad() { echo "::error::$1"; fail=1; }
+          for f in AGENTS.md .codex/config.toml .omp/config.yml .claude/settings.json; do
+            git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || bad "$f is not tracked"
+            if git check-ignore --no-index -q -- "$f"; then bad "$f is matched by .gitignore"; fi
+          done
+          # Mac /Users/... and Windows C:\Users\..., including JSON/TOML-escaped and forward-slash forms.
+          hits="$(git grep -nIE -e '/Users/' -e '[A-Za-z]:(\\|/)+[Uu][Ss][Ee][Rr][Ss](\\|/)' -- AGENTS.md .codex .omp .claude .aelpha || true)"
+          while IFS= read -r hit; do
+            [ -n "$hit" ] && bad "$(printf '%s' "$hit" | cut -d: -f1-2) has a machine-absolute path"
+          done <<< "$hits"
+          ego=.aelpha/EGO.md
+          mode="$(git ls-files -s -- "$ego" | cut -d' ' -f1)"
+          if [ "$mode" != 120000 ]; then
+            bad "$ego must be a tracked symlink to ../AGENTS.md (found: ${mode:-not tracked})"
+          else
+            target="$(readlink "$ego")"
+            case "$target" in
+              /*) bad "$ego must be a relative symlink to ../AGENTS.md (found: an absolute target)" ;;
+              *) [ "$ego" -ef AGENTS.md ] || bad "$ego must resolve to AGENTS.md (found: $target)" ;;
+            esac
+          fi
+          [ "$fail" -eq 0 ] && echo "Loadout hygiene: pass"
+          exit "$fail"
+
+      - name: Detect stack
+        id: stack
+        run: |
+          set -euo pipefail
+          node_lint=false; ruff=false
+          if [ -f package.json ]; then
+            node_lint="$(python3 -c 'import json; s = json.load(open("package.json")).get("scripts") or {}; print(str("lint" in s).lower())')"
+            [ "$node_lint" = true ] && echo "package.json: npm run lint" || echo "package.json has no lint script: npm lint skipped"
+          fi
+          if [ -f pyproject.toml ]; then
+            if grep -Eq '^\[tool\.ruff' pyproject.toml || [ -f ruff.toml ] || [ -f .ruff.toml ]; then
+              ruff=true; echo "pyproject.toml: ruff check"
+            else
+              echo "pyproject.toml has no ruff configuration: ruff skipped"
+            fi
+          fi
+          [ -f package.json ] || [ -f pyproject.toml ] || echo "No package.json or pyproject.toml: stack lint skipped"
+          { echo "node_lint=$node_lint"; echo "ruff=$ruff"; } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        if: steps.stack.outputs.node_lint == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+
+      - name: npm lint
+        if: steps.stack.outputs.node_lint == 'true'
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then npm ci --ignore-scripts --no-audit --no-fund
+          else npm install --ignore-scripts --no-audit --no-fund; fi
+          npm run lint
+
+      - name: ruff
+        if: steps.stack.outputs.ruff == 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/ruff.tgz" \
+            "https://github.com/astral-sh/ruff/releases/download/${RUFF_VERSION}/ruff-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$RUFF_SHA256  $RUNNER_TEMP/ruff.tgz" | sha256sum -c --quiet -
+          tar -xzf "$RUNNER_TEMP/ruff.tgz" -C "$RUNNER_TEMP/bin" --strip-components=1 ruff-x86_64-unknown-linux-gnu/ruff
+          "$RUNNER_TEMP/bin/ruff" check .
+
+      # Every check above passed. Native auto-merge (merge commit) lands the PR once the required
+      # `baseline / checks` status, this job, completes green.
+      - name: Enable native auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$IS_DRAFT" = true ]; then
+            echo "::notice::Draft PR: auto-merge is enabled on the run after it is marked ready for review."
+            exit 0
+          fi
+          "$RUNNER_TEMP/bin/gh" pr merge --auto --merge --match-head-commit "$HEAD_SHA" "$PR" --repo "$REPO"
